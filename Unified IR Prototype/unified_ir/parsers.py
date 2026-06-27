@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ast
 import re
@@ -9,7 +9,7 @@ from .operator_catalog import BINOP_TO_IR, BOOL_TO_IR, CALL_TO_IR, COMPARE_TO_IR
 
 
 class ParseError(Exception):
-    """Raised when the prototype cannot parse the requested input."""
+    pass
 
 
 def parse_source(
