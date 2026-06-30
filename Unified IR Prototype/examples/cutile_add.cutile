@@ -1,11 +1,24 @@
 kernel vector_add(x, y, z, n_elements, BLOCK_SIZE) {
   pid = program_id(0);
-  block_start = pid * BLOCK_SIZE;
+  block_start = tile_mul(pid, BLOCK_SIZE);
   offsets0 = arange(0, BLOCK_SIZE);
-  offsets = block_start + offsets0;
+  offsets = tile_add(block_start, offsets0);
   mask = offsets < n_elements;
   x_tile = load(x + offsets, mask=mask, other=0.0);
   y_tile = load(y + offsets, mask=mask, other=0.0);
-  z_tile = x_tile + y_tile;
+  z_tile = tile_add(x_tile, y_tile);
+  store(z + offsets, z_tile, mask=mask);
+}
+
+kernel scaled_vector_add(x, y, z, alpha, n_elements, BLOCK_SIZE) {
+  pid = program_id(0);
+  block_start = tile_mul(pid, BLOCK_SIZE);
+  offsets0 = arange(0, BLOCK_SIZE);
+  offsets = tile_add(block_start, offsets0);
+  mask = offsets < n_elements;
+  x_tile = load(x + offsets, mask=mask, other=0.0);
+  y_tile = load(y + offsets, mask=mask, other=0.0);
+  scaled_x = tile_mul(x_tile, alpha);
+  z_tile = tile_add(scaled_x, y_tile);
   store(z + offsets, z_tile, mask=mask);
 }

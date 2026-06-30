@@ -49,25 +49,28 @@ class TritonParser:
         except SyntaxError as exc:
             raise ParseError(f"Triton input is not valid Python: {exc}") from exc
 
-        function = self._find_kernel(tree)
-        if function is None:
+        functions = self._find_kernels(tree)
+        if not functions:
             raise ParseError("no function found for Triton kernel")
 
         self.program = IRProgram("triton", source_name, max_ops=self.max_ops)
-        params = [arg.arg for arg in function.args.args]
-        self.program.add("kernel", name=function.name, params=params)
-        for stmt in function.body:
-            self._stmt(stmt)
+        for function in functions:
+            params = [arg.arg for arg in function.args.args]
+            self.program.add("kernel", name=function.name, params=params)
+            for stmt in function.body:
+                self._stmt(stmt)
         return self.program
 
     @staticmethod
-    def _find_kernel(tree: ast.Module) -> ast.FunctionDef | None:
+    def _find_kernels(tree: ast.Module) -> list[ast.FunctionDef]:
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+        kernels: list[ast.FunctionDef] = []
         for function in functions:
             for decorator in function.decorator_list:
                 if _expr_to_str(decorator) in {"triton.jit", "jit"}:
-                    return function
-        return functions[0] if functions else None
+                    kernels.append(function)
+                    break
+        return kernels or functions
 
     def _stmt(self, stmt: ast.stmt) -> None:
         if isinstance(stmt, ast.Assign):
@@ -173,13 +176,38 @@ class CuTileParser:
 
     def parse(self, source: str, source_name: str) -> IRProgram:
         cleaned = _strip_c_comments(source)
-        kernel_name, params = self._kernel_signature(cleaned)
         self.program = IRProgram("cutile", source_name, max_ops=self.max_ops)
-        self.program.add("kernel", name=kernel_name, params=params)
-
-        for statement in self._statements(cleaned):
-            self._statement(statement)
+        kernel_blocks = self._kernel_blocks(cleaned)
+        if kernel_blocks:
+            for kernel_name, params, body in kernel_blocks:
+                self.program.add("kernel", name=kernel_name, params=params)
+                for statement in self._statements(body):
+                    self._statement(statement)
+        else:
+            kernel_name, params = self._kernel_signature(cleaned)
+            self.program.add("kernel", name=kernel_name, params=params)
+            for statement in self._statements(cleaned):
+                self._statement(statement)
         return self.program
+
+    @staticmethod
+    def _kernel_blocks(source: str) -> list[tuple[str, list[str], str]]:
+        signature = re.compile(
+            r"\b(?:kernel|void|__global__\s+void)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{"
+        )
+        blocks: list[tuple[str, list[str], str]] = []
+        for match in signature.finditer(source):
+            body_start = match.end()
+            body_end = _find_matching_brace(source, body_start - 1)
+            if body_end is None:
+                continue
+            params = [
+                _last_identifier(part.strip())
+                for part in match.group(2).split(",")
+                if part.strip()
+            ]
+            blocks.append((match.group(1), params, source[body_start:body_end]))
+        return blocks
 
     @staticmethod
     def _kernel_signature(source: str) -> tuple[str, list[str]]:
@@ -318,6 +346,19 @@ def _last_identifier(value: str) -> str:
 def _between_parens(value: str) -> str:
     match = re.search(r"\((.*)\)", value)
     return match.group(1).strip() if match else ""
+
+
+def _find_matching_brace(source: str, open_index: int) -> int | None:
+    depth = 0
+    for index in range(open_index, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
 
 
 def _parse_call(expr: str) -> tuple[str, list[str]] | None:
