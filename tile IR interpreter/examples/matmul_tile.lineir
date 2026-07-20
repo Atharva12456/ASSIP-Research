@@ -1,0 +1,9 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/matmul_tile.lineir
+# max_ops=220
+0000 | kernel       | name=matmul_tile params="A,B,C"
+0001 | load         | out=a buf=A
+0002 | load         | out=b buf=B
+0003 | dot          | out=c lhs=a rhs=b
+0004 | store        | buf=C value=c

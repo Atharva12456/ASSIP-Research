@@ -1,0 +1,12 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/load_compute_store.lineir
+# max_ops=220
+0000 | kernel       | name=load_compute_store params="A,B,D,C,E"
+0001 | load         | out=a buf=A
+0002 | load         | out=b buf=B
+0003 | add          | out=c lhs=a rhs=b
+0004 | store        | buf=C value=c
+0005 | load         | out=d buf=D
+0006 | mul          | out=e lhs=c rhs=d
+0007 | store        | buf=E value=e

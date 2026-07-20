@@ -1,0 +1,12 @@
+# unified-tile-ir line-format v0
+# source_lang=triton
+# source=examples/scale_add.lineir
+# max_ops=220
+0000 | kernel       | name=scale_add params="x_ptr,y_ptr,out_ptr,alpha"
+0001 | arange       | out=offsets stop=8
+0002 | load         | out=x ptr="x_ptr + offsets"
+0003 | load         | out=y ptr="y_ptr + offsets"
+0004 | mul          | out=scaled lhs=x rhs=alpha
+0005 | add          | out=z lhs=scaled rhs=y
+0006 | store        | ptr="out_ptr + offsets" value=z
+0007 | return       | value=z

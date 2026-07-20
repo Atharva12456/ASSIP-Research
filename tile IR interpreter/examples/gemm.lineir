@@ -1,0 +1,13 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/gemm.lineir
+# max_ops=220
+0000 | kernel       | name=gemm params="A,B,C,D,alpha,beta"
+0001 | load         | out=a buf=A
+0002 | load         | out=b buf=B
+0003 | load         | out=c buf=C
+0004 | dot          | out=p lhs=a rhs=b
+0005 | mul          | out=scaled lhs=p rhs=alpha
+0006 | mul          | out=biased lhs=c rhs=beta
+0007 | add          | out=d lhs=scaled rhs=biased
+0008 | store        | buf=D value=d
