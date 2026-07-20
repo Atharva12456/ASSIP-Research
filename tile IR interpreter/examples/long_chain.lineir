@@ -1,0 +1,34 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/long_chain.lineir
+# max_ops=220
+0000 | kernel       | name=long_chain params="A0,A1,A2,A3,A4,A5,A6,A7,T0,T1,OUT"
+0001 | load         | out=a0 buf=A0
+0002 | load         | out=a1 buf=A1
+0003 | load         | out=a2 buf=A2
+0004 | load         | out=a3 buf=A3
+0005 | load         | out=a4 buf=A4
+0006 | load         | out=a5 buf=A5
+0007 | load         | out=a6 buf=A6
+0008 | load         | out=a7 buf=A7
+0009 | add          | out=s0 lhs=a0 rhs=a1
+0010 | add          | out=s1 lhs=a2 rhs=a3
+0011 | add          | out=s2 lhs=a4 rhs=a5
+0012 | add          | out=s3 lhs=a6 rhs=a7
+0013 | mul          | out=p0 lhs=s0 rhs=s1
+0014 | mul          | out=p1 lhs=s2 rhs=s3
+0015 | store        | buf=T0 value=p0
+0016 | store        | buf=T1 value=p1
+0017 | add          | out=q lhs=p0 rhs=p1
+0018 | sub          | out=r0 lhs=s0 rhs=s1
+0019 | sub          | out=r1 lhs=s2 rhs=s3
+0020 | mul          | out=r2 lhs=r0 rhs=r1
+0021 | add          | out=t lhs=q rhs=r2
+0022 | max          | out=m lhs=t rhs=0.0
+0023 | sqrt         | out=g value=m
+0024 | arange       | out=idx stop=4
+0025 | lt           | out=msk lhs=idx rhs=2
+0026 | select       | out=u cond=msk true=g false=t
+0027 | add          | out=w lhs=u rhs=q
+0028 | store        | buf=OUT value=w
+0029 | return       | value=w

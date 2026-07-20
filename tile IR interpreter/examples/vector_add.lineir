@@ -1,0 +1,14 @@
+# unified-tile-ir line-format v0
+# source_lang=triton
+# source=examples/vector_add.lineir
+# max_ops=220
+0000 | kernel       | name=vector_add params="x_ptr,y_ptr,out_ptr"
+0001 | program_id   | out=pid axis=0
+0002 | mul          | out=block_start lhs=pid rhs=8
+0003 | arange       | out=offs stop=8
+0004 | add          | out=offsets lhs=block_start rhs=offs
+0005 | load         | out=x ptr="x_ptr + offsets"
+0006 | load         | out=y ptr="y_ptr + offsets"
+0007 | add          | out=z lhs=x rhs=y
+0008 | store        | ptr="out_ptr + offsets" value=z
+0009 | return       | value=z

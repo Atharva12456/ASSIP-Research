@@ -1,0 +1,13 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/reduction.lineir
+# max_ops=220
+0000 | kernel       | name=reduction params="A,RowSum,Total,Norm"
+0001 | load         | out=a buf=A
+0002 | reduce       | out=rows value=a op=sum axis=1
+0003 | reduce       | out=total value=rows op=sum
+0004 | reduce       | out=rowmax value=a op=max axis=1 keepdims=true
+0005 | sub          | out=shifted lhs=a rhs=rowmax
+0006 | store        | buf=RowSum value=rows
+0007 | store        | buf=Total value=total
+0008 | store        | buf=Norm value=shifted

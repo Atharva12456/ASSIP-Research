@@ -1,0 +1,19 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/control_flow.lineir
+# max_ops=220
+0000 | kernel       | name=control_flow params="src,dst,limit"
+0001 | load         | out=v buf=src
+0002 | assign       | out=acc value=0.0
+0003 | for          | target=i iter="range(4)"
+0004 | lt           | out=small lhs=i rhs=limit
+0005 | if           | cond=small
+0006 | mul          | out=term lhs=i rhs=2
+0007 | else         |
+0008 | mul          | out=term lhs=i rhs=10
+0009 | endif        |
+0010 | add          | out=acc lhs=acc rhs=term inplace=true
+0011 | endfor       |
+0012 | add          | out=w lhs=v rhs=acc
+0013 | store        | buf=dst value=w
+0014 | return       | value=acc

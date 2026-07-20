@@ -1,0 +1,10 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/transpose.lineir
+# max_ops=220
+0000 | kernel       | name=transpose params="A,T,G"
+0001 | load         | out=a buf=A
+0002 | transpose    | out=t value=a
+0003 | store        | buf=T value=t
+0004 | dot          | out=g lhs=t rhs=a
+0005 | store        | buf=G value=g

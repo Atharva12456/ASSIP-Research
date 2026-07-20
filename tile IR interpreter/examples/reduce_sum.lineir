@@ -1,0 +1,14 @@
+# unified-tile-ir line-format v0
+# source_lang=triton
+# source=examples/reduce_sum.lineir
+# max_ops=220
+0000 | kernel       | name=reduce_sum params="src,aux,dst"
+0001 | arange       | out=offsets stop=16
+0002 | load         | out=v ptr="src + offsets"
+0003 | load         | out=u ptr="aux + offsets"
+0004 | call         | out=total callee=sum args=v
+0005 | call         | out=extra callee=sum args=u
+0006 | add          | out=grand lhs=total rhs=extra
+0007 | sqrt         | out=root value=grand
+0008 | store        | buf=dst value=root
+0009 | return       | value=root
