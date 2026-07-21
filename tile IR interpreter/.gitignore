@@ -1,6 +1,6 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
+ 
 # NOTE: unlike the sibling prototype, *.lineir is NOT ignored here.
 # The .lineir files under examples/ are the interpreter's test programs.
