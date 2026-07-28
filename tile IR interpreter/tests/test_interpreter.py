@@ -310,6 +310,35 @@ class MathOpcodeTests(unittest.TestCase):
         self.assertEqual(kept.shape, (1, 1))
         self.assertEqual(kept.to_nested(), [[10.0]])
 
+    def test_reshape_takes_a_dimension_string(self) -> None:
+        a = Tile.from_flat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), "f32")
+        result = one("reshape | out=r value=a shape=2x3", a=a)
+        self.assertEqual(result.env["r"].shape, (2, 3))
+        self.assertEqual(result.env["r"].to_nested(), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+    def test_broadcast_stretches_a_size_one_axis(self) -> None:
+        a = Tile.from_flat([1.0, 2.0], (2, 1), "f32")
+        result = one("broadcast | out=b value=a shape=2x3", a=a)
+        self.assertEqual(result.env["b"].to_nested(), [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]])
+
+    def test_broadcast_rejects_an_incompatible_shape(self) -> None:
+        a = Tile.from_flat([1.0, 2.0, 3.0], (3,), "f32")
+        with self.assertRaises(ShapeError):
+            one("broadcast | out=b value=a shape=2x2", a=a)
+
+    def test_mma_accumulates_into_its_third_operand(self) -> None:
+        left = Tile.from_nested([[1.0, 2.0], [3.0, 4.0]])
+        right = Tile.from_nested([[5.0, 6.0], [7.0, 8.0]])
+        acc = Tile.from_nested([[1.0, 1.0], [1.0, 1.0]])
+        result = one("mma | out=z lhs=a rhs=b acc=c", a=left, b=right, c=acc)
+        self.assertEqual(result.env["z"].to_nested(), [[20.0, 23.0], [44.0, 51.0]])
+
+    def test_mma_without_an_accumulator_is_a_plain_product(self) -> None:
+        left = Tile.from_nested([[1.0, 2.0], [3.0, 4.0]])
+        right = Tile.from_nested([[1.0, 0.0], [0.0, 1.0]])
+        result = one("mma | out=z lhs=a rhs=b", a=left, b=right)
+        self.assertEqual(result.env["z"].to_nested(), [[1.0, 2.0], [3.0, 4.0]])
+
     def test_reduce_rejects_an_unknown_combiner(self) -> None:
         a = Tile.from_nested([[1.0, 2.0]])
         with self.assertRaises(UnsupportedOpcode):
@@ -784,7 +813,10 @@ REDUCTION_BATTERY = """0000 | assign    | out=M value="[[1.0,2.0],[3.0,4.0]]"
 0001 | transpose | out=Mt value=M
 0002 | reduce    | out=Rows value=M op=sum axis=1
 0003 | reduce    | out=Top value=M op=max axis=1 keepdims=true
-0004 | reduce    | out=All value=M op=sum"""
+0004 | reduce    | out=All value=M op=sum
+0005 | reshape   | out=Flat value=M shape=4
+0006 | broadcast | out=Wide value=Top shape=2x2
+0007 | mma       | out=Prod lhs=M rhs=M acc=M"""
 
 CONTROL_BATTERY = """0000 | assign   | out=t value=0
 0001 | for      | target=i iter=range(3)

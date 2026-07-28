@@ -1,0 +1,131 @@
+// A corrected 64x64 tiled GEMM: C[64x64] = A[64x128] @ B[128x64].
+//
+// Two K tiles, so the loop and the pointer advance both do real work. Every
+// difference from the draft is marked FIX.
+cuda_tile.module @gemm_tile_64x64_module {
+    entry @gemm_tile_64x64_kernel(
+        %a_ptr_base_scalar: tile<ptr<f32>>,
+        %b_ptr_base_scalar: tile<ptr<f32>>,
+        %c_ptr_base_scalar: tile<ptr<f32>>
+    ) {
+        %block_x_index, %block_y_index, %block_z_index = get_tile_block_id : tile<i32>
+
+        %tile_size = cuda_tile.constant <i32: 64> : tile<i32>
+
+        // FIX: separate strides per matrix. A is 64x128 so its row stride is 128;
+        // B is 128x64 and C is 64x64 so theirs are 64. The draft used one
+        // constant of 64 for every dimension, including the contiguous one.
+        %a_row_stride = cuda_tile.constant <i32: 128> : tile<64x64xi32>
+        %bc_row_stride = cuda_tile.constant <i32: 64> : tile<64x64xi32>
+
+        // FIX: the contiguous dimension has stride 1, not 64.
+        %unit_stride = cuda_tile.constant <i32: 1> : tile<64x64xi32>
+
+        // FIX: the loop bound is the NUMBER OF K TILES (128 / 64 = 2), which is a
+        // different quantity from the tile size. They coincide only at 4096.
+        %num_k_tiles = cuda_tile.constant <i32: 2> : tile<i32>
+        %range_start = cuda_tile.constant <i32: 0> : tile<i32>
+        %range_step = cuda_tile.constant <i32: 1> : tile<i32>
+        %init_accum = cuda_tile.constant <f32: 0.000000e+00> : tile<64x64xf32>
+
+        %tile_size_range = cuda_tile.iota : tile<64xi32>
+
+        // ---- A tile offsets: m[:, None] * a_row_stride + k[None, :] * 1 ----
+        %a_tile_base = cuda_tile.muli %block_x_index, %tile_size : tile<i32>
+        %a_tile_base_reshape = cuda_tile.reshape %a_tile_base : tile<i32> -> tile<1xi32>
+        %a_tile_base_tensor = cuda_tile.broadcast %a_tile_base_reshape : tile<1xi32> -> tile<64xi32>
+        %m_offsets_vec = cuda_tile.addi %a_tile_base_tensor, %tile_size_range : tile<64xi32>
+
+        %m_offsets_matrix = cuda_tile.reshape %m_offsets_vec : tile<64xi32> -> tile<64x1xi32>
+        %m_offsets_broadcast = cuda_tile.broadcast %m_offsets_matrix : tile<64x1xi32> -> tile<64x64xi32>
+        %m_offsets = cuda_tile.muli %m_offsets_broadcast, %a_row_stride : tile<64x64xi32>
+
+        %ak_offsets_matrix = cuda_tile.reshape %tile_size_range : tile<64xi32> -> tile<1x64xi32>
+        %ak_offsets_broadcast = cuda_tile.broadcast %ak_offsets_matrix : tile<1x64xi32> -> tile<64x64xi32>
+        %ak_offsets = cuda_tile.muli %ak_offsets_broadcast, %unit_stride : tile<64x64xi32>
+
+        %a_tile_offsets = cuda_tile.addi %m_offsets, %ak_offsets : tile<64x64xi32>
+
+        // ---- B tile offsets: k[:, None] * bc_row_stride + n[None, :] * 1 ----
+        %b_tile_base = cuda_tile.muli %block_y_index, %tile_size : tile<i32>
+        %b_tile_base_reshape = cuda_tile.reshape %b_tile_base : tile<i32> -> tile<1xi32>
+        %b_tile_base_tensor = cuda_tile.broadcast %b_tile_base_reshape : tile<1xi32> -> tile<64xi32>
+        %n_offsets_vec = cuda_tile.addi %b_tile_base_tensor, %tile_size_range : tile<64xi32>
+
+        %bk_offsets_matrix = cuda_tile.reshape %tile_size_range : tile<64xi32> -> tile<64x1xi32>
+        %bk_offsets_broadcast = cuda_tile.broadcast %bk_offsets_matrix : tile<64x1xi32> -> tile<64x64xi32>
+        %bk_offsets = cuda_tile.muli %bk_offsets_broadcast, %bc_row_stride : tile<64x64xi32>
+
+        %n_offsets_matrix = cuda_tile.reshape %n_offsets_vec : tile<64xi32> -> tile<1x64xi32>
+        %n_offsets_broadcast = cuda_tile.broadcast %n_offsets_matrix : tile<1x64xi32> -> tile<64x64xi32>
+        %n_offsets = cuda_tile.muli %n_offsets_broadcast, %unit_stride : tile<64x64xi32>
+
+        // FIX: addi, not muli. The draft multiplied the two offset matrices.
+        %b_tile_offsets = cuda_tile.addi %bk_offsets, %n_offsets : tile<64x64xi32>
+
+        // ---- base pointers ----
+        %a_ptr_base_tensor = cuda_tile.reshape %a_ptr_base_scalar : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+        %a_ptr = cuda_tile.broadcast %a_ptr_base_tensor : tile<1x1xptr<f32>> -> tile<64x64xptr<f32>>
+        %a_tile_ptr = offset %a_ptr, %a_tile_offsets : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+        %b_ptr_tile_tensor = reshape %b_ptr_base_scalar : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+        %b_ptr = broadcast %b_ptr_tile_tensor : tile<1x1xptr<f32>> -> tile<64x64xptr<f32>>
+        %b_tile_ptr = offset %b_ptr, %b_tile_offsets : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+        // FIX: A advances along K by 64 contiguous elements; B advances by 64 whole
+        // rows, which is 64 * 64. The draft used one constant for both.
+        %a_k_advance = cuda_tile.constant <i32: 64> : tile<64x64xi32>
+        %b_k_advance = cuda_tile.constant <i32: 4096> : tile<64x64xi32>
+
+        // FIX: step is %range_step (1). The draft passed %range_start (0).
+        %C_tile, %a_ptr_final, %b_ptr_final = for %k in (%range_start to %num_k_tiles, step %range_step) : tile<i32>
+            iter_values(
+                %acc_prev = %init_accum,
+                %a_tile_ptr_prev = %a_tile_ptr,
+                %b_tile_ptr_prev = %b_tile_ptr
+            ) -> (tile<64x64xf32>, tile<64x64xptr<f32>>, tile<64x64xptr<f32>>)
+        {
+            // FIX: load through the CARRIED pointers. The draft loaded through
+            // %a_tile_ptr and %b_tile_ptr, so the advance below was dead code and
+            // every iteration re-read the same tile.
+            %A_tile, %token_a = load_ptr_tko weak %a_tile_ptr_prev : tile<64x64xptr<f32>> -> tile<64x64xf32>, token
+            %B_tile, %token_b = load_ptr_tko weak %b_tile_ptr_prev : tile<64x64xptr<f32>> -> tile<64x64xf32>, token
+
+            %C_tile_acc = mmaf %A_tile, %B_tile, %acc_prev : tile<64x64xf32>, tile<64x64xf32>, tile<64x64xf32>
+
+            %a_tile_ptr_next = offset %a_tile_ptr_prev, %a_k_advance : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+            %b_tile_ptr_next = offset %b_tile_ptr_prev, %b_k_advance : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+            continue %C_tile_acc, %a_tile_ptr_next, %b_tile_ptr_next : tile<64x64xf32>, tile<64x64xptr<f32>>, tile<64x64xptr<f32>>
+        }
+
+        // ---- C tile offsets: m[:, None] * bc_row_stride + n[None, :] * 1 ----
+        %c_tile_x_start = muli %block_x_index, %tile_size : tile<i32>
+        %c_tile_x_start_reshape = reshape %c_tile_x_start : tile<i32> -> tile<1xi32>
+        %c_tile_x_start_tensor = broadcast %c_tile_x_start_reshape : tile<1xi32> -> tile<64xi32>
+        %c_tile_x_offsets_vec = addi %c_tile_x_start_tensor, %tile_size_range : tile<64xi32>
+
+        // FIX: block_y_index. The draft used block_x_index for the N coordinate.
+        %c_tile_y_start = muli %block_y_index, %tile_size : tile<i32>
+        %c_tile_y_start_reshape = reshape %c_tile_y_start : tile<i32> -> tile<1xi32>
+        %c_tile_y_start_tensor = broadcast %c_tile_y_start_reshape : tile<1xi32> -> tile<64xi32>
+        %c_tile_y_offsets_vec = addi %c_tile_y_start_tensor, %tile_size_range : tile<64xi32>
+
+        %c_tile_x_offsets_matrix = reshape %c_tile_x_offsets_vec : tile<64xi32> -> tile<64x1xi32>
+        %c_tile_x_offsets_broadcast = broadcast %c_tile_x_offsets_matrix : tile<64x1xi32> -> tile<64x64xi32>
+        %c_tile_x_offsets = muli %c_tile_x_offsets_broadcast, %bc_row_stride : tile<64x64xi32>
+
+        %c_tile_y_offsets_matrix = reshape %c_tile_y_offsets_vec : tile<64xi32> -> tile<1x64xi32>
+        %c_tile_y_offsets_broadcast = broadcast %c_tile_y_offsets_matrix : tile<1x64xi32> -> tile<64x64xi32>
+        %c_tile_y_offsets = muli %c_tile_y_offsets_broadcast, %unit_stride : tile<64x64xi32>
+
+        // FIX: addi, not muli.
+        %c_tile_offsets = addi %c_tile_x_offsets, %c_tile_y_offsets : tile<64x64xi32>
+
+        %c_ptr_base_tensor = reshape %c_ptr_base_scalar : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+        %c_ptr = broadcast %c_ptr_base_tensor : tile<1x1xptr<f32>> -> tile<64x64xptr<f32>>
+        %c_tile_ptr = offset %c_ptr, %c_tile_offsets : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+        store_ptr_tko weak %c_tile_ptr, %C_tile : tile<64x64xptr<f32>>, tile<64x64xf32> -> token
+    }
+}
