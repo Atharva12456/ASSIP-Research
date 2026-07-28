@@ -45,18 +45,39 @@ def rule(title: str) -> None:
     print()
 
 
-def synthesize_seed(program, elems: int) -> dict[str, Tile]:
-    """Deterministic 1-D inputs for every buffer a load or store names."""
+def _buffer_roles(program) -> tuple[set[str], set[str]]:
+    """Buffers a program reads and buffers it writes, across both memory models."""
     inputs, outputs = set(), set()
     for op in program.ops:
         if op.opcode == "load":
             inputs.add(memory_target(op)[0])
         elif op.opcode == "store":
             outputs.add(memory_target(op)[0])
+        elif op.opcode == "load_view" and op.get("buf"):
+            inputs.add(op.get("buf"))
+        elif op.opcode == "store_view" and op.get("buf"):
+            outputs.add(op.get("buf"))
+    return inputs, outputs
+
+
+def synthesize_seed(program, elems: int, dim: int) -> dict[str, Tile]:
+    """Deterministic inputs for a program with no registered reference.
+
+    Buffers get 1-D data; scalar parameters (shapes and strides in the view model)
+    default to dim. When the program uses tensor views, buffers are sized dim*dim
+    so a dim x dim tile fits.
+    """
+    inputs, outputs = _buffer_roles(program)
+    buffers = {name for name in inputs | outputs if name}
+    uses_views = any(op.opcode == "tensor_view" for op in program.ops)
+    size = max(elems, dim * dim) if uses_views else elems
     seed: dict[str, Tile] = {}
-    for name in sorted(inputs | outputs):
-        data = [float(i % 7) for i in range(elems)] if name in inputs else [0.0] * elems
-        seed[name] = Tile.from_flat(data, (elems,), "f32")
+    for name in sorted(buffers):
+        data = [float(i % 7) for i in range(size)] if name in inputs else [0.0] * size
+        seed[name] = Tile.from_flat(data, (size,), "f32")
+    for param in program.params():
+        if param not in buffers and param not in seed:
+            seed[param] = Tile.scalar(dim, "i32")
     return seed
 
 
@@ -71,9 +92,11 @@ def load_any(path: Path):
 
 def show(program, *, title: str, summary: str, source: str | None,
          seed: dict[str, Tile], outputs: list[str], reference=None,
-         grid=(1,), pids=(0,)) -> int:
+         grid=(1,), pids=(0,), note: str | None = None) -> int:
     print("=" * WIDTH)
     print(f"  {title}  --  {summary}")
+    if note:
+        print(f"  note: {note}")
     print("=" * WIDTH)
 
     if source is not None:
@@ -135,7 +158,7 @@ def _required_buffers(program) -> set[str]:
     return {memory_target(op)[0] for op in program.ops if op.opcode in ("load", "store")}
 
 
-def run_file(path: Path, elems: int, pids: tuple[int, ...]) -> int:
+def run_file(path: Path, elems: int, dim: int, pids: tuple[int, ...]) -> int:
     program, source = load_any(path)
     required = _required_buffers(program)
     # Use the registered reference only when its buffers actually match this
@@ -147,12 +170,15 @@ def run_file(path: Path, elems: int, pids: tuple[int, ...]) -> int:
         if required <= set(seed):
             return show(program, title=path.name, summary=ex.summary, source=source,
                         seed=seed, outputs=ex.outputs, reference=ex.reference)
-    seed = synthesize_seed(program, elems)
-    outputs = sorted({memory_target(op)[0] for op in program.ops if op.opcode == "store"})
+    seed = synthesize_seed(program, elems, dim)
+    _, outputs = _buffer_roles(program)
     grid = pids or (1,)
+    note = None
+    if any(op.opcode == "tensor_view" for op in program.ops):
+        note = f"shapes and strides default to {dim}; buffers are {dim}x{dim}"
     return show(program, title=path.name, summary="your program",
-                source=source, seed=seed, outputs=outputs,
-                grid=grid, pids=pids)
+                source=source, seed=seed, outputs=sorted(outputs),
+                grid=grid, pids=pids, note=note)
 
 
 def main(argv: list[str]) -> int:
@@ -161,6 +187,8 @@ def main(argv: list[str]) -> int:
                         help="an example name, or a .lineir / .tileir file")
     parser.add_argument("--elems", type=int, default=4096,
                         help="buffer size when inputs are synthesized")
+    parser.add_argument("--dim", type=int, default=128,
+                        help="default shape/stride for view kernels with dynamic sizes")
     parser.add_argument("--pid", default="0,0,0", help="program ids, comma separated")
     parser.add_argument("--list", action="store_true", help="list the built-in examples")
     args = parser.parse_args(argv[1:])
@@ -178,7 +206,7 @@ def main(argv: list[str]) -> int:
     )
     try:
         if path.exists():
-            return run_file(path, args.elems, pids)
+            return run_file(path, args.elems, args.dim, pids)
         if looks_like_file:
             print(f"no such file: {path}", file=sys.stderr)
             print("  create the file first, then paste your CUDA Tile IR or line-format IR "

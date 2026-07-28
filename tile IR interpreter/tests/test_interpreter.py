@@ -339,6 +339,40 @@ class MathOpcodeTests(unittest.TestCase):
         result = one("mma | out=z lhs=a rhs=b", a=left, b=right)
         self.assertEqual(result.env["z"].to_nested(), [[1.0, 2.0], [3.0, 4.0]])
 
+    def test_tensor_view_partition_and_load_transposes(self) -> None:
+        # A stored as 2x3 (K x M); a dim_map=[1,0] partition reads it transposed.
+        buf = Tile.from_flat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), "f32")
+        program = parse_lineir(
+            '0000 | tensor_view    | out=V buf=Buf shape="2,3" strides="3,1"\n'
+            '0001 | partition_view | out=P view=V tile="3,2" dim_map="1,0"\n'
+            '0002 | load_view      | out=blk view=P buf=Buf index="0,0"'
+        )
+        result = Interpreter(program).run(Buf=buf)
+        self.assertEqual(result.env["blk"].shape, (3, 2))
+        self.assertEqual(result.env["blk"].to_nested(), [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]])
+
+    def test_index_space_counts_tiles(self) -> None:
+        buf = Tile.zeros((48,), "f32")
+        program = parse_lineir(
+            '0000 | tensor_view    | out=V buf=Buf shape="6,8" strides="8,1"\n'
+            '0001 | partition_view | out=P view=V tile="2,4" dim_map="0,1"\n'
+            '0002 | index_space    | out="(nrows,ncols)" view=P'
+        )
+        result = Interpreter(program).run(Buf=buf)
+        self.assertEqual(result.env["nrows"], 3)  # ceil(6/2)
+        self.assertEqual(result.env["ncols"], 2)  # ceil(8/4)
+
+    def test_store_view_scatters_a_tile_back(self) -> None:
+        buf = Tile.zeros((6,), "f32")
+        program = parse_lineir(
+            '0000 | tensor_view    | out=V buf=Buf shape="2,3" strides="3,1"\n'
+            '0001 | partition_view | out=P view=V tile="2,3" dim_map="0,1"\n'
+            '0002 | fill           | out=t args="[2,3]" value=7.0\n'
+            '0003 | store_view     | view=P buf=Buf value=t index="0,0"'
+        )
+        result = Interpreter(program).run(Buf=buf)
+        self.assertEqual(result.memory.buffer("Buf").tile.to_nested(), [7.0] * 6)
+
     def test_reduce_rejects_an_unknown_combiner(self) -> None:
         a = Tile.from_nested([[1.0, 2.0]])
         with self.assertRaises(UnsupportedOpcode):
@@ -818,6 +852,12 @@ REDUCTION_BATTERY = """0000 | assign    | out=M value="[[1.0,2.0],[3.0,4.0]]"
 0006 | broadcast | out=Wide value=Top shape=2x2
 0007 | mma       | out=Prod lhs=M rhs=M acc=M"""
 
+VIEW_BATTERY = """0000 | tensor_view    | out=V buf=Buf shape="2,3" strides="3,1"
+0001 | partition_view | out=P view=V tile="2,3" dim_map="0,1"
+0002 | index_space    | out="(nr,nc)" view=P
+0003 | load_view      | out=blk view=P buf=Buf index="0,0"
+0004 | store_view     | view=P buf=Buf value=blk index="0,0\""""
+
 CONTROL_BATTERY = """0000 | assign   | out=t value=0
 0001 | for      | target=i iter=range(3)
 0002 | if       | cond="i > 0"
@@ -848,6 +888,7 @@ class OpcodeCoverageTests(unittest.TestCase):
             (MATH_BATTERY, {}),
             (DOT_BATTERY, {}),
             (REDUCTION_BATTERY, {}),
+            (VIEW_BATTERY, {"Buf": Tile.from_flat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), "f32")}),
             (CONTROL_BATTERY, {}),
         ]
 
