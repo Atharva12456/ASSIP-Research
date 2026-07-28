@@ -192,6 +192,11 @@ def main(argv: list[str]) -> int:
     except KeyError as exc:
         print(exc, file=sys.stderr)
         return 2
+    except (ValueError, TypeError, ZeroDivisionError) as exc:
+        # A malformed kernel can still trip a bare arithmetic error deep in
+        # execution; report it as a failure rather than a traceback.
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

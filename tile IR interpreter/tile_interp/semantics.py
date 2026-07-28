@@ -602,6 +602,8 @@ def _exec_for(ctx: "ExecContext", op: Op) -> object:
         if node.keywords or not 1 <= len(node.args) <= 3:
             raise IRError(f"{_where_op(op)}: range takes 1 to 3 positional arguments")
         bounds = [_as_int(ctx.value(ast.unparse(arg))) for arg in node.args]
+        if len(bounds) == 3 and bounds[2] == 0:
+            raise IRError(f"{_where_op(op)}: loop step is zero in iter {text!r}")
         return list(range(*bounds))
     value = ctx.value(text)
     if isinstance(value, Tile):
