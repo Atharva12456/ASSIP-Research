@@ -103,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.set_defaults(handler=cmd_verify)
 
+    translate = subparsers.add_parser(
+        "translate", help="Print the line-format IR for a program (translates .tileir)."
+    )
+    _add_source(translate)
+    translate.add_argument("--out", help="Write the IR to this file instead of stdout.")
+    translate.set_defaults(handler=cmd_translate)
+
     ops = subparsers.add_parser("ops", help="List supported opcodes with kind and latency.")
     ops.set_defaults(handler=cmd_ops)
     return parser
@@ -124,6 +131,20 @@ def main(argv: list[str] | None = None) -> int:
     except _RUNTIME_ERRORS as exc:
         print(f"{PROG}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_FAIL
+
+
+def cmd_translate(args: argparse.Namespace) -> int:
+    """Print the line-format IR for a program, translating CUDA Tile IR when needed."""
+    from .lineir import to_lineir
+
+    program = load_program(args.source)
+    text = to_lineir(program)
+    if getattr(args, "out", None):
+        Path(args.out).write_text(text + "\n")
+        print(f"wrote {len(program)} ops to {args.out}")
+    else:
+        print(text)
+    return EXIT_OK
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -215,12 +236,23 @@ def cmd_ops(args: argparse.Namespace) -> int:
 
 
 def load_program(path_text: str | None) -> Program:
-    """Parse a line-format file, or stdin when the path is '-' or omitted."""
+    """Load a program from a file or stdin.
+
+    A .tileir file is NVIDIA CUDA Tile IR and is translated to the line format
+    first; anything else is parsed as the line format directly.
+    """
     if path_text is None or path_text == "-":
         return parse_lineir(sys.stdin.read(), "<stdin>")
     path = Path(path_text)
     if not path.is_file():
         raise CliError(f"no such file: {path}")
+    if path.suffix == ".tileir":
+        from .cuda_tile import CuTileError, translate_cuda_tile_file
+
+        try:
+            return translate_cuda_tile_file(path)
+        except CuTileError as exc:
+            raise CliError(f"could not translate {path}: {exc}") from exc
     return parse_lineir_file(path)
 
 

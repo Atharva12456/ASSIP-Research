@@ -522,6 +522,37 @@ def _exec_transpose(ctx: "ExecContext", op: Op) -> object:
     return bind_output(ctx, op, as_tile(ctx.value(op.require("value"))).transpose())
 
 
+def _shape_attr(ctx: "ExecContext", op: Op) -> object:
+    """The 'shape' attribute, accepting either 64x64 or a list expression."""
+    text = op.require("shape")
+    if "x" in text and not text.strip().startswith("["):
+        return tuple(int(part) for part in text.strip().split("x") if part)
+    return _as_shape(ctx.value(text))
+
+
+def _exec_reshape(ctx: "ExecContext", op: Op) -> object:
+    tile = as_tile(ctx.value(op.require("value")))
+    return bind_output(ctx, op, tile.reshape(_shape_attr(ctx, op)))
+
+
+def _exec_broadcast(ctx: "ExecContext", op: Op) -> object:
+    tile = as_tile(ctx.value(op.require("value")))
+    return bind_output(ctx, op, tile.broadcast_to(_shape_attr(ctx, op)))
+
+
+def _exec_mma(ctx: "ExecContext", op: Op) -> object:
+    """Fused tile multiply-accumulate: acc + (lhs @ rhs)."""
+    lhs = as_tile(ctx.value(op.require("lhs")))
+    rhs = as_tile(ctx.value(op.require("rhs")))
+    product = lhs.matmul(rhs)
+    acc_text = op.get("acc")
+    if acc_text is None:
+        return bind_output(ctx, op, product)
+    acc = as_tile(ctx.value(acc_text))
+    dtype = result_dtype(acc.dtype, product.dtype)
+    return bind_output(ctx, op, acc.zip_with(product, lambda a, b: a + b, dtype))
+
+
 def _exec_assign(ctx: "ExecContext", op: Op) -> object:
     text = op.get("value")
     value = None if text is None else ctx.value(text)
@@ -733,6 +764,9 @@ OPCODES: dict[str, OpSpec] = dict(
             _exec_reduce,
         ),
         _spec("transpose", "math", 3, _effects_value("value"), _exec_transpose),
+        _spec("reshape", "math", 1, _effects_value("value", "shape"), _exec_reshape),
+        _spec("broadcast", "math", 1, _effects_value("value", "shape"), _exec_broadcast),
+        _spec("mma", "math", 6, _effects_value("lhs", "rhs", "acc"), _exec_mma),
         _spec("exp", "math", 3, _effects_value("value"), _exec_unary_math),
         _spec("sqrt", "math", 3, _effects_value("value"), _exec_unary_math),
         _spec("max", "math", 1, _effects_value("lhs", "rhs"), _exec_minmax),
