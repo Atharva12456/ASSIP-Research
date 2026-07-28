@@ -476,10 +476,16 @@ def load_program(path: Path) -> Program:
     return parse_lineir_file(path)
 
 
-def registry_seed(stem: str) -> dict[str, Tile] | None:
+def registry_seed(stem: str, required: set[str]) -> dict[str, Tile] | None:
+    """The registered seeds for this stem, but only if they cover its buffers.
+
+    A .tileir file can share a stem with a line-format example while naming its
+    buffers differently, so a stem match alone is not enough.
+    """
     if example is None or stem not in set(example_names()):
         return None
-    return example(stem).seed()
+    seed = example(stem).seed()
+    return seed if required <= set(seed) else None
 
 
 def synthesize_seed(program: Program, elems: int) -> dict[str, Tile]:
@@ -504,7 +510,8 @@ def synthesize_seed(program: Program, elems: int) -> dict[str, Tile]:
 def run_checks(path: Path, elems: int, pids: tuple[int, ...],
                rtol: float, atol: float) -> int:
     program = load_program(path)
-    seed = registry_seed(path.stem)
+    required = {memory_target(op)[0] for op in program.ops if op.opcode in ("load", "store")}
+    seed = registry_seed(path.stem, required)
     origin = "reference registry"
     if seed is None:
         seed = synthesize_seed(program, elems)

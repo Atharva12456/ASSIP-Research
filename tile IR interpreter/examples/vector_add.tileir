@@ -1,0 +1,39 @@
+// The smallest useful CUDA Tile IR kernel: elementwise Z = X + Y over 8 lanes.
+//
+// Use this as a template. Copy it, change the computation in the middle, and run
+//     python demo.py examples/vector_add.tileir
+// The three parameters become buffers X, Y, Z (the leading word of each name,
+// upper-cased). X and Y are read, Z is written.
+cuda_tile.module @vector_add_module {
+    entry @vector_add_kernel(
+        %x_ptr: tile<ptr<f32>>,
+        %y_ptr: tile<ptr<f32>>,
+        %z_ptr: tile<ptr<f32>>
+    ) {
+        // A vector of lane offsets 0..7.
+        %offsets = cuda_tile.iota : tile<8xi32>
+
+        // Turn each base pointer into a tile of pointers, then add the offsets.
+        %x_ptr_tensor = cuda_tile.reshape %x_ptr : tile<ptr<f32>> -> tile<1xptr<f32>>
+        %x_ptr_bc = cuda_tile.broadcast %x_ptr_tensor : tile<1xptr<f32>> -> tile<8xptr<f32>>
+        %x_tile_ptr = offset %x_ptr_bc, %offsets : tile<8xptr<f32>>, tile<8xi32> -> tile<8xptr<f32>>
+
+        %y_ptr_tensor = cuda_tile.reshape %y_ptr : tile<ptr<f32>> -> tile<1xptr<f32>>
+        %y_ptr_bc = cuda_tile.broadcast %y_ptr_tensor : tile<1xptr<f32>> -> tile<8xptr<f32>>
+        %y_tile_ptr = offset %y_ptr_bc, %offsets : tile<8xptr<f32>>, tile<8xi32> -> tile<8xptr<f32>>
+
+        // Load both tiles.
+        %x, %token_x = load_ptr_tko weak %x_tile_ptr : tile<8xptr<f32>> -> tile<8xf32>, token
+        %y, %token_y = load_ptr_tko weak %y_tile_ptr : tile<8xptr<f32>> -> tile<8xf32>, token
+
+        // The actual computation. Change this line to change the kernel.
+        %z = cuda_tile.addf %x, %y : tile<8xf32>
+
+        // Store the result to Z.
+        %z_ptr_tensor = cuda_tile.reshape %z_ptr : tile<ptr<f32>> -> tile<1xptr<f32>>
+        %z_ptr_bc = cuda_tile.broadcast %z_ptr_tensor : tile<1xptr<f32>> -> tile<8xptr<f32>>
+        %z_tile_ptr = offset %z_ptr_bc, %offsets : tile<8xptr<f32>>, tile<8xi32> -> tile<8xptr<f32>>
+
+        store_ptr_tko weak %z_tile_ptr, %z : tile<8xptr<f32>>, tile<8xf32> -> token
+    }
+}

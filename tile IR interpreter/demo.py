@@ -20,14 +20,21 @@ import sys
 from pathlib import Path
 
 from reference.kernels import EXAMPLES, example, example_names
-from tile_interp.interpreter import Interpreter
+from tile_interp.interpreter import Interpreter, InterpreterError
+from tile_interp.ir import IRError
 from tile_interp.lineir import parse_lineir_file, to_lineir
-from tile_interp.memory import Memory
+from tile_interp.memory import Memory, MemoryError_
 from tile_interp.scheduler import DependencyGraph, schedule
-from tile_interp.semantics import memory_target
+from tile_interp.semantics import UnsupportedOpcode, memory_target
 from tile_interp.trace import TraceRecorder
 from tile_interp.values import Tile
 from tile_interp.verify import verify_kernel
+
+try:
+    from tile_interp.cuda_tile import CuTileError
+except Exception:  # pragma: no cover
+    class CuTileError(Exception):
+        pass
 
 WIDTH = 78
 
@@ -124,13 +131,22 @@ def run_example(name: str) -> int:
     )
 
 
+def _required_buffers(program) -> set[str]:
+    return {memory_target(op)[0] for op in program.ops if op.opcode in ("load", "store")}
+
+
 def run_file(path: Path, elems: int, pids: tuple[int, ...]) -> int:
     program, source = load_any(path)
-    # a bundled example may still be recognized by its file stem
+    required = _required_buffers(program)
+    # Use the registered reference only when its buffers actually match this
+    # program. A .tileir file can share a stem with a line-format example while
+    # naming its buffers differently, so a stem match alone is not enough.
     if path.stem in EXAMPLES:
         ex = EXAMPLES[path.stem]
-        return show(program, title=path.name, summary=ex.summary, source=source,
-                    seed=ex.seed(), outputs=ex.outputs, reference=ex.reference)
+        seed = ex.seed()
+        if required <= set(seed):
+            return show(program, title=path.name, summary=ex.summary, source=source,
+                        seed=seed, outputs=ex.outputs, reference=ex.reference)
     seed = synthesize_seed(program, elems)
     outputs = sorted({memory_target(op)[0] for op in program.ops if op.opcode == "store"})
     grid = pids or (1,)
@@ -155,10 +171,24 @@ def main(argv: list[str]) -> int:
 
     pids = tuple(int(p) for p in args.pid.split(",") if p.strip())
     path = Path(args.program)
+    looks_like_file = (
+        path.suffix in (".lineir", ".tileir")
+        or "/" in args.program
+        or "\\" in args.program
+    )
     try:
         if path.exists():
             return run_file(path, args.elems, pids)
+        if looks_like_file:
+            print(f"no such file: {path}", file=sys.stderr)
+            print("  create the file first, then paste your CUDA Tile IR or line-format IR "
+                  "into it.", file=sys.stderr)
+            print("  a working template is at examples/vector_add.tileir", file=sys.stderr)
+            return 2
         return run_example(args.program)
+    except (CuTileError, IRError, MemoryError_, InterpreterError, UnsupportedOpcode) as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     except KeyError as exc:
         print(exc, file=sys.stderr)
         return 2

@@ -200,9 +200,18 @@ class CuTileTranslator:
         text = _strip_comments(source)
         _PARTIAL.clear()
 
+        if not text.strip():
+            raise CuTileError(
+                "the file is empty; paste a CUDA Tile IR kernel into it "
+                "(see examples/vector_add.tileir for the smallest working one)"
+            )
         entry = re.search(r"entry\s+@([\w.]+)\s*\((.*?)\)\s*\{", text, re.DOTALL)
         if entry is None:
-            raise CuTileError("no 'entry @name(...) {' found")
+            raise CuTileError(
+                "no 'entry @name(...) {' block found; a CUDA Tile IR kernel needs "
+                "'cuda_tile.module @m { entry @name(%a: tile<ptr<f32>>, ...) { ... } }' "
+                "(see examples/vector_add.tileir)"
+            )
 
         name = entry.group(1)
         self.params = [
