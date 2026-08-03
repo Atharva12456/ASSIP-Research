@@ -32,7 +32,7 @@ import numpy as np
 from tile_interp.interpreter import Interpreter, match_blocks
 from tile_interp.ir import Op, Program, split_list
 from tile_interp.lineir import parse_lineir_file
-from tile_interp.memory import Memory
+from tile_interp.memory import Memory, MemoryError_
 from tile_interp.semantics import memory_target, split_args
 from tile_interp.values import Tile
 
@@ -585,6 +585,37 @@ def synthesize_seed(program: Program, elems: int, dim: int = 128) -> dict[str, T
     return seed
 
 
+def _fits(program: Program, seed: dict[str, Tile], pids: tuple[int, ...]) -> bool:
+    """True if the interpreter runs to completion without indexing past its buffers."""
+    mem = Memory()
+    for name, tile in seed.items():
+        mem.declare(name, tile)
+    try:
+        Interpreter(program, memory=mem, grid=pids or (1,), program_ids=pids).run(**seed)
+        return True
+    except MemoryError_:
+        return False
+
+
+def _autosize_seed(program: Program, elems: int, pids: tuple[int, ...]):
+    """Grow synthesized scratch buffers until the kernel's indices fit.
+
+    Synthesized inputs have no true size, so a tiled kernel (a GEMM whose block
+    indices sweep the whole matrix) can address past any fixed --elems. Double
+    from elems until the run completes, bounded so a genuinely out-of-bounds
+    kernel still stops. Returns (seed, size, grew).
+    """
+    cap = 1 << 20
+    size = elems
+    seed = synthesize_seed(program, size)
+    grew = False
+    while size < cap and not _fits(program, seed, pids):
+        size *= 2
+        seed = synthesize_seed(program, size)
+        grew = True
+    return seed, size, grew
+
+
 def run_checks(path: Path, elems: int, pids: tuple[int, ...],
                rtol: float, atol: float) -> int:
     program = load_program(path)
@@ -592,8 +623,10 @@ def run_checks(path: Path, elems: int, pids: tuple[int, ...],
     seed = registry_seed(path.stem, required)
     origin = "reference registry"
     if seed is None:
-        seed = synthesize_seed(program, elems)
-        origin = f"synthesized ({elems} elems/buffer)"
+        seed, size, grew = _autosize_seed(program, elems, pids)
+        origin = f"synthesized ({size} elems/buffer)"
+        if grew:
+            origin += f", grown from {elems}"
 
     # interpreter side
     interp_mem = Memory()
@@ -646,7 +679,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Check the interpreter against numpy.")
     parser.add_argument("program", help="a .lineir or .tileir file")
     parser.add_argument("--elems", type=int, default=20000,
-                        help="buffer size when inputs are synthesized")
+                        help="starting buffer size when inputs are synthesized "
+                             "(grown automatically if the kernel indexes past it)")
     parser.add_argument("--pid", default="0,0,0", help="program ids, comma separated")
     parser.add_argument("--rtol", type=float, default=1e-9)
     parser.add_argument("--atol", type=float, default=1e-12)

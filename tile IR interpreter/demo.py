@@ -81,6 +81,37 @@ def synthesize_seed(program, elems: int, dim: int) -> dict[str, Tile]:
     return seed
 
 
+def _fits(program, seed: dict[str, Tile], grid, pids) -> bool:
+    """True if the program runs to completion without indexing past its buffers."""
+    memory = Memory()
+    for name, tile in seed.items():
+        memory.declare(name, tile)
+    try:
+        Interpreter(program, memory=memory, grid=grid, program_ids=pids).run(**seed)
+        return True
+    except MemoryError_:
+        return False
+
+
+def _autosize_seed(program, elems: int, dim: int, grid, pids):
+    """Grow synthesized scratch buffers until the kernel's indices fit.
+
+    Synthesized inputs have no true size, so a tiled kernel -- a GEMM whose block
+    indices sweep the whole matrix, say -- can address past any fixed --elems.
+    Double from elems until the run completes, bounded so a genuinely out-of-bounds
+    kernel still stops. Returns (seed, size, grew).
+    """
+    cap = 1 << 20
+    size = elems
+    seed = synthesize_seed(program, size, dim)
+    grew = False
+    while size < cap and not _fits(program, seed, grid, pids):
+        size *= 2
+        seed = synthesize_seed(program, size, dim)
+        grew = True
+    return seed, size, grew
+
+
 def load_any(path: Path):
     """Load a .lineir or .tileir file, returning (program, source_text_or_None)."""
     if path.suffix == ".tileir":
@@ -170,15 +201,29 @@ def run_file(path: Path, elems: int, dim: int, pids: tuple[int, ...]) -> int:
         if required <= set(seed):
             return show(program, title=path.name, summary=ex.summary, source=source,
                         seed=seed, outputs=ex.outputs, reference=ex.reference)
-    seed = synthesize_seed(program, elems, dim)
-    _, outputs = _buffer_roles(program)
     grid = pids or (1,)
-    note = None
+    seed, size, grew = _autosize_seed(program, elems, dim, grid, pids)
+    _, outputs = _buffer_roles(program)
+    notes = []
     if any(op.opcode == "tensor_view" for op in program.ops):
-        note = f"shapes and strides default to {dim}; buffers are {dim}x{dim}"
-    return show(program, title=path.name, summary="your program",
-                source=source, seed=seed, outputs=sorted(outputs),
-                grid=grid, pids=pids, note=note)
+        notes.append(f"shapes and strides default to {dim}; buffers are {dim}x{dim}")
+    if grew:
+        notes.append(f"synthesized buffers grown to {size} values so the kernel's "
+                     f"indices fit (set --elems to fix the size)")
+    note = "; ".join(notes) or None
+    try:
+        return show(program, title=path.name, summary="your program",
+                    source=source, seed=seed, outputs=sorted(outputs),
+                    grid=grid, pids=pids, note=note)
+    except MemoryError_ as exc:
+        # Even at the growth cap the kernel indexes past its buffers. That is a
+        # kernel-level out-of-bounds, not an under-sized scratch, so say so.
+        print(f"MemoryError_: {exc}", file=sys.stderr)
+        print(f"  synthesized buffers were grown to {size} values and the kernel "
+              f"still indexes past them.", file=sys.stderr)
+        print("  this usually means an out-of-bounds access in the kernel itself.",
+              file=sys.stderr)
+        return 2
 
 
 def main(argv: list[str]) -> int:
@@ -186,7 +231,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("program", nargs="?", default="gemm",
                         help="an example name, or a .lineir / .tileir file")
     parser.add_argument("--elems", type=int, default=4096,
-                        help="buffer size when inputs are synthesized")
+                        help="starting buffer size when inputs are synthesized "
+                             "(grown automatically if the kernel indexes past it)")
     parser.add_argument("--dim", type=int, default=128,
                         help="default shape/stride for view kernels with dynamic sizes")
     parser.add_argument("--pid", default="0,0,0", help="program ids, comma separated")
