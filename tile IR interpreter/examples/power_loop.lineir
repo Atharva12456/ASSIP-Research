@@ -1,0 +1,11 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/power_loop.lineir
+# max_ops=220
+0000 | kernel       | name=power_loop params="X,Out"
+0001 | load         | out=x buf=X
+0002 | assign       | out=acc value=x
+0003 | for          | target=k iter=range(0,3)
+0004 | mul          | out=acc lhs=acc rhs=x
+0005 | endfor       |
+0006 | store        | buf=Out value=acc

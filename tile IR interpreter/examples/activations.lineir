@@ -1,0 +1,12 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/activations.lineir
+# max_ops=220
+0000 | kernel       | name=activations params="X,R,T,S"
+0001 | load         | out=x buf=X
+0002 | relu         | out=r value=x
+0003 | tanh         | out=t value=x
+0004 | sigmoid      | out=s value=x
+0005 | store        | buf=R value=r
+0006 | store        | buf=T value=t
+0007 | store        | buf=S value=s

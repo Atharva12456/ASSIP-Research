@@ -267,6 +267,27 @@ class MathOpcodeTests(unittest.TestCase):
         self.assertEqual(one("select | out=z cond=true true=1 false=2").env["z"], 1)
         self.assertEqual(one("select | out=z cond=false true=1 false=2").env["z"], 2)
 
+    def test_relu_clamps_negatives(self) -> None:
+        result = one("relu | out=z value=v", v=Tile.from_flat([-2.0, -0.1, 0.0, 3.0], (4,), "f32"))
+        self.assertEqual(result.env["z"].to_nested(), [0.0, 0.0, 0.0, 3.0])
+
+    def test_sigmoid_and_tanh_at_zero(self) -> None:
+        zero = Tile.from_flat([0.0], (1,), "f32")
+        self.assertAlmostEqual(one("sigmoid | out=z value=v", v=zero).env["z"].data[0], 0.5)
+        self.assertAlmostEqual(one("tanh | out=z value=v", v=zero).env["z"].data[0], 0.0)
+
+    def test_neg_and_abs_keep_integer_dtype(self) -> None:
+        v = Tile.from_flat([5, -6], (2,), "i32")
+        neg = one("neg | out=z value=v", v=v).env["z"]
+        absed = one("abs | out=z value=v", v=v).env["z"]
+        self.assertEqual((neg.to_nested(), neg.dtype), ([-5, 6], "i32"))
+        self.assertEqual((absed.to_nested(), absed.dtype), ([5, 6], "i32"))
+
+    def test_floor_and_ceil(self) -> None:
+        v = Tile.from_flat([1.2, 2.8, -1.5], (3,), "f32")
+        self.assertEqual(one("floor | out=z value=v", v=v).env["z"].to_nested(), [1.0, 2.0, -2.0])
+        self.assertEqual(one("ceil | out=z value=v", v=v).env["z"].to_nested(), [2.0, 3.0, -1.0])
+
     def test_transpose_reverses_the_axes(self) -> None:
         a = Tile.from_nested([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
         result = one("transpose | out=t value=a", a=a)
@@ -338,6 +359,40 @@ class MathOpcodeTests(unittest.TestCase):
         right = Tile.from_nested([[1.0, 0.0], [0.0, 1.0]])
         result = one("mma | out=z lhs=a rhs=b", a=left, b=right)
         self.assertEqual(result.env["z"].to_nested(), [[1.0, 2.0], [3.0, 4.0]])
+
+    def test_tensor_view_partition_and_load_transposes(self) -> None:
+        # A stored as 2x3 (K x M); a dim_map=[1,0] partition reads it transposed.
+        buf = Tile.from_flat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), "f32")
+        program = parse_lineir(
+            '0000 | tensor_view    | out=V buf=Buf shape="2,3" strides="3,1"\n'
+            '0001 | partition_view | out=P view=V tile="3,2" dim_map="1,0"\n'
+            '0002 | load_view      | out=blk view=P buf=Buf index="0,0"'
+        )
+        result = Interpreter(program).run(Buf=buf)
+        self.assertEqual(result.env["blk"].shape, (3, 2))
+        self.assertEqual(result.env["blk"].to_nested(), [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]])
+
+    def test_index_space_counts_tiles(self) -> None:
+        buf = Tile.zeros((48,), "f32")
+        program = parse_lineir(
+            '0000 | tensor_view    | out=V buf=Buf shape="6,8" strides="8,1"\n'
+            '0001 | partition_view | out=P view=V tile="2,4" dim_map="0,1"\n'
+            '0002 | index_space    | out="(nrows,ncols)" view=P'
+        )
+        result = Interpreter(program).run(Buf=buf)
+        self.assertEqual(result.env["nrows"], 3)  # ceil(6/2)
+        self.assertEqual(result.env["ncols"], 2)  # ceil(8/4)
+
+    def test_store_view_scatters_a_tile_back(self) -> None:
+        buf = Tile.zeros((6,), "f32")
+        program = parse_lineir(
+            '0000 | tensor_view    | out=V buf=Buf shape="2,3" strides="3,1"\n'
+            '0001 | partition_view | out=P view=V tile="2,3" dim_map="0,1"\n'
+            '0002 | fill           | out=t args="[2,3]" value=7.0\n'
+            '0003 | store_view     | view=P buf=Buf value=t index="0,0"'
+        )
+        result = Interpreter(program).run(Buf=buf)
+        self.assertEqual(result.memory.buffer("Buf").tile.to_nested(), [7.0] * 6)
 
     def test_reduce_rejects_an_unknown_combiner(self) -> None:
         a = Tile.from_nested([[1.0, 2.0]])
@@ -818,6 +873,27 @@ REDUCTION_BATTERY = """0000 | assign    | out=M value="[[1.0,2.0],[3.0,4.0]]"
 0006 | broadcast | out=Wide value=Top shape=2x2
 0007 | mma       | out=Prod lhs=M rhs=M acc=M"""
 
+UNARY_BATTERY = """0000 | fill    | out=x args="[3]" value=2.0
+0001 | log     | out=o1 value=x
+0002 | sin     | out=o2 value=x
+0003 | cos     | out=o3 value=x
+0004 | tanh    | out=o4 value=x
+0005 | sigmoid | out=o5 value=x
+0006 | rsqrt   | out=o6 value=x
+0007 | recip   | out=o7 value=x
+0008 | abs     | out=o8 value=x
+0009 | neg     | out=o9 value=x
+0010 | floor   | out=o10 value=x
+0011 | ceil    | out=o11 value=x
+0012 | sign    | out=o12 value=x
+0013 | relu    | out=o13 value=x"""
+
+VIEW_BATTERY = """0000 | tensor_view    | out=V buf=Buf shape="2,3" strides="3,1"
+0001 | partition_view | out=P view=V tile="2,3" dim_map="0,1"
+0002 | index_space    | out="(nr,nc)" view=P
+0003 | load_view      | out=blk view=P buf=Buf index="0,0"
+0004 | store_view     | view=P buf=Buf value=blk index="0,0\""""
+
 CONTROL_BATTERY = """0000 | assign   | out=t value=0
 0001 | for      | target=i iter=range(3)
 0002 | if       | cond="i > 0"
@@ -848,6 +924,8 @@ class OpcodeCoverageTests(unittest.TestCase):
             (MATH_BATTERY, {}),
             (DOT_BATTERY, {}),
             (REDUCTION_BATTERY, {}),
+            (UNARY_BATTERY, {}),
+            (VIEW_BATTERY, {"Buf": Tile.from_flat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), "f32")}),
             (CONTROL_BATTERY, {}),
         ]
 

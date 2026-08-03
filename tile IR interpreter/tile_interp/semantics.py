@@ -26,6 +26,7 @@ from .values import (
     infer_dtype,
     result_dtype,
 )
+from .views import PartitionView, TensorView
 
 if TYPE_CHECKING:
     from .interpreter import ExecContext
@@ -452,14 +453,37 @@ def _exec_select(ctx: "ExecContext", op: Op) -> object:
     return bind_output(ctx, op, _where_select(cond, on_true, on_false))
 
 
-def _exec_unary_math(ctx: "ExecContext", op: Op) -> object:
-    fn = math.exp if op.opcode == "exp" else math.sqrt
+# Elementwise unary ops. The first group always returns a float; the second
+# keeps the operand's dtype so abs and neg of an integer stay integer.
+_FLOAT_UNARY: dict[str, Callable[[float], float]] = {
+    "exp": math.exp,
+    "log": math.log,
+    "sqrt": math.sqrt,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tanh": math.tanh,
+    "sigmoid": lambda x: 1.0 / (1.0 + math.exp(-x)),
+    "rsqrt": lambda x: 1.0 / math.sqrt(x),
+    "recip": lambda x: 1.0 / x,
+}
+_KEEP_UNARY: dict[str, Callable[[float], float]] = {
+    "abs": abs,
+    "neg": lambda x: -x,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "sign": lambda x: (x > 0) - (x < 0),
+    "relu": lambda x: x if x > 0 else 0,
+}
+
+
+def _exec_unary(ctx: "ExecContext", op: Op) -> object:
+    keep = op.opcode in _KEEP_UNARY
+    fn = _KEEP_UNARY[op.opcode] if keep else _FLOAT_UNARY[op.opcode]
     value = ctx.value(op.require("value"))
     if isinstance(value, Tile):
-        result: object = value.map(lambda item: _guard_math(fn, item), float_dtype(value.dtype))
-    else:
-        result = _guard_math(fn, value)
-    return bind_output(ctx, op, result)
+        dtype = value.dtype if keep else float_dtype(value.dtype)
+        return bind_output(ctx, op, value.map(lambda item: _guard_math(fn, item), dtype))
+    return bind_output(ctx, op, _guard_math(fn, value))
 
 
 def _exec_minmax(ctx: "ExecContext", op: Op) -> object:
@@ -553,6 +577,74 @@ def _exec_mma(ctx: "ExecContext", op: Op) -> object:
     return bind_output(ctx, op, acc.zip_with(product, lambda a, b: a + b, dtype))
 
 
+def _literal_ints(text: str) -> tuple[int, ...]:
+    """A comma list of integer literals, e.g. tile="128,64"."""
+    return tuple(int(part) for part in split_list(text))
+
+
+def _evaluated_ints(ctx: "ExecContext", text: str) -> tuple[int, ...]:
+    """A comma list of integer expressions evaluated against the env, e.g. "K,M"."""
+    return tuple(_as_int(ctx.value(part)) for part in split_list(text))
+
+
+def _exec_tensor_view(ctx: "ExecContext", op: Op) -> object:
+    view = TensorView(
+        op.require("buf"),
+        _evaluated_ints(ctx, op.require("shape")),
+        _evaluated_ints(ctx, op.require("strides")),
+    )
+    return bind_output(ctx, op, view)
+
+
+def _exec_partition_view(ctx: "ExecContext", op: Op) -> object:
+    tensor = ctx.value(op.require("view"))
+    if not isinstance(tensor, TensorView):
+        raise IRError(f"{_where_op(op)}: partition_view needs a tensor view, got {tensor!r}")
+    view = PartitionView(tensor, _literal_ints(op.require("tile")), _literal_ints(op.require("dim_map")))
+    return bind_output(ctx, op, view)
+
+
+def _exec_index_space(ctx: "ExecContext", op: Op) -> object:
+    view = ctx.value(op.require("view"))
+    if not isinstance(view, PartitionView):
+        raise IRError(f"{_where_op(op)}: index_space needs a partition view, got {view!r}")
+    return bind_output(ctx, op, [int(count) for count in view.index_space()])
+
+
+def _partition(ctx: "ExecContext", op: Op) -> PartitionView:
+    view = ctx.value(op.require("view"))
+    if not isinstance(view, PartitionView):
+        raise IRError(f"{_where_op(op)}: expected a partition view, got {view!r}")
+    return view
+
+
+def _exec_load_view(ctx: "ExecContext", op: Op) -> object:
+    view = _partition(ctx, op)
+    index = view.index_tile(_evaluated_ints(ctx, op.require("index")))
+    return bind_output(ctx, op, ctx.memory.load(view.tensor.buffer, index))
+
+
+def _exec_store_view(ctx: "ExecContext", op: Op) -> object:
+    view = _partition(ctx, op)
+    index = view.index_tile(_evaluated_ints(ctx, op.require("index")))
+    ctx.memory.store(view.tensor.buffer, as_tile(ctx.value(op.require("value"))), index)
+    return None
+
+
+def _effects_tensor_view(op: Op) -> Effects:
+    return Effects(read_names(op, "shape", "strides"), output_names(op), [], [])
+
+
+def _effects_load_view(op: Op) -> Effects:
+    buf = op.get("buf")
+    return Effects(read_names(op, "view", "index"), output_names(op), [buf] if buf else [], [])
+
+
+def _effects_store_view(op: Op) -> Effects:
+    buf = op.get("buf")
+    return Effects(read_names(op, "view", "value", "index"), [], [], [buf] if buf else [])
+
+
 def _exec_assign(ctx: "ExecContext", op: Op) -> object:
     text = op.get("value")
     value = None if text is None else ctx.value(text)
@@ -602,6 +694,8 @@ def _exec_for(ctx: "ExecContext", op: Op) -> object:
         if node.keywords or not 1 <= len(node.args) <= 3:
             raise IRError(f"{_where_op(op)}: range takes 1 to 3 positional arguments")
         bounds = [_as_int(ctx.value(ast.unparse(arg))) for arg in node.args]
+        if len(bounds) == 3 and bounds[2] == 0:
+            raise IRError(f"{_where_op(op)}: loop step is zero in iter {text!r}")
         return list(range(*bounds))
     value = ctx.value(text)
     if isinstance(value, Tile):
@@ -767,8 +861,13 @@ OPCODES: dict[str, OpSpec] = dict(
         _spec("reshape", "math", 1, _effects_value("value", "shape"), _exec_reshape),
         _spec("broadcast", "math", 1, _effects_value("value", "shape"), _exec_broadcast),
         _spec("mma", "math", 6, _effects_value("lhs", "rhs", "acc"), _exec_mma),
-        _spec("exp", "math", 3, _effects_value("value"), _exec_unary_math),
-        _spec("sqrt", "math", 3, _effects_value("value"), _exec_unary_math),
+        _spec("tensor_view", "memory", 1, _effects_tensor_view, _exec_tensor_view),
+        _spec("partition_view", "memory", 1, _effects_value("view"), _exec_partition_view),
+        _spec("index_space", "memory", 1, _effects_value("view"), _exec_index_space),
+        _spec("load_view", "memory", 4, _effects_load_view, _exec_load_view),
+        _spec("store_view", "memory", 4, _effects_store_view, _exec_store_view),
+        *(_spec(name, "math", 3, _effects_value("value"), _exec_unary) for name in _FLOAT_UNARY),
+        *(_spec(name, "math", 1, _effects_value("value"), _exec_unary) for name in _KEEP_UNARY),
         _spec("max", "math", 1, _effects_value("lhs", "rhs"), _exec_minmax),
         _spec("min", "math", 1, _effects_value("lhs", "rhs"), _exec_minmax),
         _spec("select", "math", 1, _effects_value("cond", "true", "false"), _exec_select),

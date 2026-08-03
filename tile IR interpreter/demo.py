@@ -20,14 +20,21 @@ import sys
 from pathlib import Path
 
 from reference.kernels import EXAMPLES, example, example_names
-from tile_interp.interpreter import Interpreter
+from tile_interp.interpreter import Interpreter, InterpreterError
+from tile_interp.ir import IRError
 from tile_interp.lineir import parse_lineir_file, to_lineir
-from tile_interp.memory import Memory
+from tile_interp.memory import Memory, MemoryError_
 from tile_interp.scheduler import DependencyGraph, schedule
-from tile_interp.semantics import memory_target
+from tile_interp.semantics import UnsupportedOpcode, memory_target
 from tile_interp.trace import TraceRecorder
 from tile_interp.values import Tile
 from tile_interp.verify import verify_kernel
+
+try:
+    from tile_interp.cuda_tile import CuTileError
+except Exception:  # pragma: no cover
+    class CuTileError(Exception):
+        pass
 
 WIDTH = 78
 
@@ -38,19 +45,71 @@ def rule(title: str) -> None:
     print()
 
 
-def synthesize_seed(program, elems: int) -> dict[str, Tile]:
-    """Deterministic 1-D inputs for every buffer a load or store names."""
+def _buffer_roles(program) -> tuple[set[str], set[str]]:
+    """Buffers a program reads and buffers it writes, across both memory models."""
     inputs, outputs = set(), set()
     for op in program.ops:
         if op.opcode == "load":
             inputs.add(memory_target(op)[0])
         elif op.opcode == "store":
             outputs.add(memory_target(op)[0])
+        elif op.opcode == "load_view" and op.get("buf"):
+            inputs.add(op.get("buf"))
+        elif op.opcode == "store_view" and op.get("buf"):
+            outputs.add(op.get("buf"))
+    return inputs, outputs
+
+
+def synthesize_seed(program, elems: int, dim: int) -> dict[str, Tile]:
+    """Deterministic inputs for a program with no registered reference.
+
+    Buffers get 1-D data; scalar parameters (shapes and strides in the view model)
+    default to dim. When the program uses tensor views, buffers are sized dim*dim
+    so a dim x dim tile fits.
+    """
+    inputs, outputs = _buffer_roles(program)
+    buffers = {name for name in inputs | outputs if name}
+    uses_views = any(op.opcode == "tensor_view" for op in program.ops)
+    size = max(elems, dim * dim) if uses_views else elems
     seed: dict[str, Tile] = {}
-    for name in sorted(inputs | outputs):
-        data = [float(i % 7) for i in range(elems)] if name in inputs else [0.0] * elems
-        seed[name] = Tile.from_flat(data, (elems,), "f32")
+    for name in sorted(buffers):
+        data = [float(i % 7) for i in range(size)] if name in inputs else [0.0] * size
+        seed[name] = Tile.from_flat(data, (size,), "f32")
+    for param in program.params():
+        if param not in buffers and param not in seed:
+            seed[param] = Tile.scalar(dim, "i32")
     return seed
+
+
+def _fits(program, seed: dict[str, Tile], grid, pids) -> bool:
+    """True if the program runs to completion without indexing past its buffers."""
+    memory = Memory()
+    for name, tile in seed.items():
+        memory.declare(name, tile)
+    try:
+        Interpreter(program, memory=memory, grid=grid, program_ids=pids).run(**seed)
+        return True
+    except MemoryError_:
+        return False
+
+
+def _autosize_seed(program, elems: int, dim: int, grid, pids):
+    """Grow synthesized scratch buffers until the kernel's indices fit.
+
+    Synthesized inputs have no true size, so a tiled kernel -- a GEMM whose block
+    indices sweep the whole matrix, say -- can address past any fixed --elems.
+    Double from elems until the run completes, bounded so a genuinely out-of-bounds
+    kernel still stops. Returns (seed, size, grew).
+    """
+    cap = 1 << 20
+    size = elems
+    seed = synthesize_seed(program, size, dim)
+    grew = False
+    while size < cap and not _fits(program, seed, grid, pids):
+        size *= 2
+        seed = synthesize_seed(program, size, dim)
+        grew = True
+    return seed, size, grew
 
 
 def load_any(path: Path):
@@ -64,9 +123,11 @@ def load_any(path: Path):
 
 def show(program, *, title: str, summary: str, source: str | None,
          seed: dict[str, Tile], outputs: list[str], reference=None,
-         grid=(1,), pids=(0,)) -> int:
+         grid=(1,), pids=(0,), note: str | None = None) -> int:
     print("=" * WIDTH)
     print(f"  {title}  --  {summary}")
+    if note:
+        print(f"  note: {note}")
     print("=" * WIDTH)
 
     if source is not None:
@@ -124,19 +185,45 @@ def run_example(name: str) -> int:
     )
 
 
-def run_file(path: Path, elems: int, pids: tuple[int, ...]) -> int:
+def _required_buffers(program) -> set[str]:
+    return {memory_target(op)[0] for op in program.ops if op.opcode in ("load", "store")}
+
+
+def run_file(path: Path, elems: int, dim: int, pids: tuple[int, ...]) -> int:
     program, source = load_any(path)
-    # a bundled example may still be recognized by its file stem
+    required = _required_buffers(program)
+    # Use the registered reference only when its buffers actually match this
+    # program. A .tileir file can share a stem with a line-format example while
+    # naming its buffers differently, so a stem match alone is not enough.
     if path.stem in EXAMPLES:
         ex = EXAMPLES[path.stem]
-        return show(program, title=path.name, summary=ex.summary, source=source,
-                    seed=ex.seed(), outputs=ex.outputs, reference=ex.reference)
-    seed = synthesize_seed(program, elems)
-    outputs = sorted({memory_target(op)[0] for op in program.ops if op.opcode == "store"})
+        seed = ex.seed()
+        if required <= set(seed):
+            return show(program, title=path.name, summary=ex.summary, source=source,
+                        seed=seed, outputs=ex.outputs, reference=ex.reference)
     grid = pids or (1,)
-    return show(program, title=path.name, summary="your program",
-                source=source, seed=seed, outputs=outputs,
-                grid=grid, pids=pids)
+    seed, size, grew = _autosize_seed(program, elems, dim, grid, pids)
+    _, outputs = _buffer_roles(program)
+    notes = []
+    if any(op.opcode == "tensor_view" for op in program.ops):
+        notes.append(f"shapes and strides default to {dim}; buffers are {dim}x{dim}")
+    if grew:
+        notes.append(f"synthesized buffers grown to {size} values so the kernel's "
+                     f"indices fit (set --elems to fix the size)")
+    note = "; ".join(notes) or None
+    try:
+        return show(program, title=path.name, summary="your program",
+                    source=source, seed=seed, outputs=sorted(outputs),
+                    grid=grid, pids=pids, note=note)
+    except MemoryError_ as exc:
+        # Even at the growth cap the kernel indexes past its buffers. That is a
+        # kernel-level out-of-bounds, not an under-sized scratch, so say so.
+        print(f"MemoryError_: {exc}", file=sys.stderr)
+        print(f"  synthesized buffers were grown to {size} values and the kernel "
+              f"still indexes past them.", file=sys.stderr)
+        print("  this usually means an out-of-bounds access in the kernel itself.",
+              file=sys.stderr)
+        return 2
 
 
 def main(argv: list[str]) -> int:
@@ -144,7 +231,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("program", nargs="?", default="gemm",
                         help="an example name, or a .lineir / .tileir file")
     parser.add_argument("--elems", type=int, default=4096,
-                        help="buffer size when inputs are synthesized")
+                        help="starting buffer size when inputs are synthesized "
+                             "(grown automatically if the kernel indexes past it)")
+    parser.add_argument("--dim", type=int, default=128,
+                        help="default shape/stride for view kernels with dynamic sizes")
     parser.add_argument("--pid", default="0,0,0", help="program ids, comma separated")
     parser.add_argument("--list", action="store_true", help="list the built-in examples")
     args = parser.parse_args(argv[1:])
@@ -155,13 +245,32 @@ def main(argv: list[str]) -> int:
 
     pids = tuple(int(p) for p in args.pid.split(",") if p.strip())
     path = Path(args.program)
+    looks_like_file = (
+        path.suffix in (".lineir", ".tileir")
+        or "/" in args.program
+        or "\\" in args.program
+    )
     try:
         if path.exists():
-            return run_file(path, args.elems, pids)
+            return run_file(path, args.elems, args.dim, pids)
+        if looks_like_file:
+            print(f"no such file: {path}", file=sys.stderr)
+            print("  create the file first, then paste your CUDA Tile IR or line-format IR "
+                  "into it.", file=sys.stderr)
+            print("  a working template is at examples/vector_add.tileir", file=sys.stderr)
+            return 2
         return run_example(args.program)
+    except (CuTileError, IRError, MemoryError_, InterpreterError, UnsupportedOpcode) as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     except KeyError as exc:
         print(exc, file=sys.stderr)
         return 2
+    except (ValueError, TypeError, ZeroDivisionError) as exc:
+        # A malformed kernel can still trip a bare arithmetic error deep in
+        # execution; report it as a failure rather than a traceback.
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -32,8 +32,8 @@ import numpy as np
 from tile_interp.interpreter import Interpreter, match_blocks
 from tile_interp.ir import Op, Program, split_list
 from tile_interp.lineir import parse_lineir_file
-from tile_interp.memory import Memory
-from tile_interp.semantics import memory_target
+from tile_interp.memory import Memory, MemoryError_
+from tile_interp.semantics import memory_target, split_args
 from tile_interp.values import Tile
 
 try:
@@ -231,8 +231,38 @@ def _index_from_ptr(op: Op, buffer: str, index_text: str | None,
     return np.asarray(np_eval(index_text, scope)).astype(np.int64)
 
 
+def _literal_ints(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in split_list(text))
+
+
+def _evaluated_ints(executor, text: str) -> tuple[int, ...]:
+    return tuple(int(np_eval(part, executor.env)) for part in split_list(text))
+
+
+def _view_index(pv: dict, block: tuple[int, ...]) -> np.ndarray:
+    """Flat buffer indices for one partition-view tile, computed with numpy."""
+    tile, dim_map = pv["tile"], pv["dim_map"]
+    strides, shape = pv["tensor"]["strides"], pv["tensor"]["shape"]
+    grids = np.indices(tile)  # grids[axis] is the coordinate along tile axis
+    tensor_coord = [np.zeros(tile, dtype=np.int64) for _ in shape]
+    for axis in range(len(tile)):
+        tensor_coord[dim_map[axis]] = block[axis] * tile[axis] + grids[axis]
+    flat = np.zeros(tile, dtype=np.int64)
+    for t in range(len(shape)):
+        flat = flat + tensor_coord[t] * strides[t]
+    return flat
+
+
 _REDUCERS = {
     "sum": np.sum, "prod": np.prod, "max": np.max, "min": np.min,
+}
+
+_NP_UNARY = {
+    "exp": np.exp, "log": np.log, "sqrt": np.sqrt, "sin": np.sin, "cos": np.cos,
+    "tanh": np.tanh, "sigmoid": lambda a: 1.0 / (1.0 + np.exp(-a)),
+    "rsqrt": lambda a: 1.0 / np.sqrt(a), "recip": lambda a: 1.0 / a,
+    "abs": np.abs, "neg": lambda a: -a, "floor": np.floor, "ceil": np.ceil,
+    "sign": np.sign, "relu": lambda a: np.maximum(a, 0.0),
 }
 
 
@@ -297,6 +327,10 @@ class NumpyExecutor:
         return self.memory
 
     def _exec(self, op: Op) -> None:
+        unary = _NP_UNARY.get(op.opcode)
+        if unary is not None:
+            self._bind(op, unary(np.asarray(self._val(op, "value"), np.float64)))
+            return
         handler = getattr(self, f"_op_{op.opcode}", None)
         if handler is None:
             raise ValueError(f"numpy executor has no rule for opcode {op.opcode!r}")
@@ -308,7 +342,7 @@ class NumpyExecutor:
         text = op.get("out")
         if not text:
             return
-        names = split_list(text)
+        names = split_list(text.strip().strip("()[]"))  # a tuple target unpacks
         if len(names) == 1:
             self.env[names[0]] = value
         else:
@@ -340,15 +374,16 @@ class NumpyExecutor:
         return np.arange(start, stop, step, dtype=np.int64)
 
     def _op_fill(self, op: Op) -> object:
-        parts = split_list(op.get("args"))
-        shape = tuple(int(np_eval(p, self.env)) for p in parts) if parts else ()
-        # args may be a single list literal like [64,64]
-        if len(parts) == 1:
-            first = np_eval(parts[0], self.env)
-            if isinstance(first, (list, tuple)):
-                shape = tuple(int(v) for v in first)
-        value = self._val(op, "value", 0.0)
-        return np.full(shape, value, dtype=np.float64)
+        parts = split_args(op.get("args"))  # respects brackets in "[64,64]"
+        shape_value = np_eval(parts[0], self.env) if parts else ()
+        if isinstance(shape_value, (list, tuple)):
+            shape = tuple(int(v) for v in shape_value)
+        else:
+            shape = (int(shape_value),)
+        value = self._val(op, "value", None)
+        if value is None and len(parts) > 1:
+            value = np_eval(parts[1], self.env)
+        return np.full(shape, 0.0 if value is None else value, dtype=np.float64)
 
     def _op_iota(self, op: Op) -> object:
         return None
@@ -406,8 +441,8 @@ class NumpyExecutor:
             out = fn(out, nxt)
         return out
 
-    def _op_exp(self, op): return np.exp(np.asarray(self._val(op, "value"), np.float64))
-    def _op_sqrt(self, op): return np.sqrt(np.asarray(self._val(op, "value"), np.float64))
+    # exp, sqrt, and the other elementwise unary ops share one numpy dispatch;
+    # see _NP_UNARY and _exec.
 
     def _op_dot(self, op): return np.matmul(self._val(op, "lhs"), self._val(op, "rhs"))
 
@@ -449,6 +484,38 @@ class NumpyExecutor:
         self.memory.store(name, np.asarray(self._val(op, "value")), index, mask)
         return None
 
+    # -- structured tensor/partition views --------------------------------
+
+    def _op_tensor_view(self, op) -> object:
+        return {
+            "buffer": op.require("buf"),
+            "shape": _evaluated_ints(self, op.require("shape")),
+            "strides": _evaluated_ints(self, op.require("strides")),
+        }
+
+    def _op_partition_view(self, op) -> object:
+        return {
+            "tensor": self._val(op, "view"),
+            "tile": _literal_ints(op.require("tile")),
+            "dim_map": _literal_ints(op.require("dim_map")),
+        }
+
+    def _op_index_space(self, op) -> object:
+        pv = self._val(op, "view")
+        shape, tile, dim_map = pv["tensor"]["shape"], pv["tile"], pv["dim_map"]
+        return [int(-(-shape[dim_map[a]] // tile[a])) for a in range(len(tile))]
+
+    def _op_load_view(self, op) -> object:
+        pv = self._val(op, "view")
+        index = _view_index(pv, _evaluated_ints(self, op.require("index")))
+        return self.memory.load(pv["tensor"]["buffer"], index, None, 0.0)
+
+    def _op_store_view(self, op) -> None:
+        pv = self._val(op, "view")
+        index = _view_index(pv, _evaluated_ints(self, op.require("index")))
+        self.memory.store(pv["tensor"]["buffer"], np.asarray(self._val(op, "value")), index, None)
+        return None
+
     # -- helpers ----------------------------------------------------------
 
     def _for_values(self, op: Op) -> list[int]:
@@ -476,14 +543,24 @@ def load_program(path: Path) -> Program:
     return parse_lineir_file(path)
 
 
-def registry_seed(stem: str) -> dict[str, Tile] | None:
+def registry_seed(stem: str, required: set[str]) -> dict[str, Tile] | None:
+    """The registered seeds for this stem, but only if they cover its buffers.
+
+    A .tileir file can share a stem with a line-format example while naming its
+    buffers differently, so a stem match alone is not enough.
+    """
     if example is None or stem not in set(example_names()):
         return None
-    return example(stem).seed()
+    seed = example(stem).seed()
+    return seed if required <= set(seed) else None
 
 
-def synthesize_seed(program: Program, elems: int) -> dict[str, Tile]:
-    """Deterministic 1-D inputs for every buffer a load or store names."""
+def synthesize_seed(program: Program, elems: int, dim: int = 128) -> dict[str, Tile]:
+    """Deterministic inputs for a program with no registered reference.
+
+    Buffers (from either memory model) get 1-D data; scalar parameters default to
+    dim; view kernels size buffers to dim*dim so a tile fits.
+    """
     inputs: set[str] = set()
     outputs: set[str] = set()
     for op in program.ops:
@@ -491,24 +568,65 @@ def synthesize_seed(program: Program, elems: int) -> dict[str, Tile]:
             inputs.add(memory_target(op)[0])
         elif op.opcode == "store":
             outputs.add(memory_target(op)[0])
+        elif op.opcode == "load_view" and op.get("buf"):
+            inputs.add(op.get("buf"))
+        elif op.opcode == "store_view" and op.get("buf"):
+            outputs.add(op.get("buf"))
+    buffers = {name for name in inputs | outputs if name}
+    uses_views = any(op.opcode == "tensor_view" for op in program.ops)
+    size = max(elems, dim * dim) if uses_views else elems
     seed: dict[str, Tile] = {}
-    for name in sorted(inputs | outputs):
-        if name in inputs:
-            data = [float(i % 7) for i in range(elems)]
-        else:
-            data = [0.0] * elems
-        seed[name] = Tile.from_flat(data, (elems,), "f32")
+    for name in sorted(buffers):
+        data = [float(i % 7) for i in range(size)] if name in inputs else [0.0] * size
+        seed[name] = Tile.from_flat(data, (size,), "f32")
+    for param in program.params():
+        if param not in buffers and param not in seed:
+            seed[param] = Tile.scalar(dim, "i32")
     return seed
+
+
+def _fits(program: Program, seed: dict[str, Tile], pids: tuple[int, ...]) -> bool:
+    """True if the interpreter runs to completion without indexing past its buffers."""
+    mem = Memory()
+    for name, tile in seed.items():
+        mem.declare(name, tile)
+    try:
+        Interpreter(program, memory=mem, grid=pids or (1,), program_ids=pids).run(**seed)
+        return True
+    except MemoryError_:
+        return False
+
+
+def _autosize_seed(program: Program, elems: int, pids: tuple[int, ...]):
+    """Grow synthesized scratch buffers until the kernel's indices fit.
+
+    Synthesized inputs have no true size, so a tiled kernel (a GEMM whose block
+    indices sweep the whole matrix) can address past any fixed --elems. Double
+    from elems until the run completes, bounded so a genuinely out-of-bounds
+    kernel still stops. Returns (seed, size, grew).
+    """
+    cap = 1 << 20
+    size = elems
+    seed = synthesize_seed(program, size)
+    grew = False
+    while size < cap and not _fits(program, seed, pids):
+        size *= 2
+        seed = synthesize_seed(program, size)
+        grew = True
+    return seed, size, grew
 
 
 def run_checks(path: Path, elems: int, pids: tuple[int, ...],
                rtol: float, atol: float) -> int:
     program = load_program(path)
-    seed = registry_seed(path.stem)
+    required = {memory_target(op)[0] for op in program.ops if op.opcode in ("load", "store")}
+    seed = registry_seed(path.stem, required)
     origin = "reference registry"
     if seed is None:
-        seed = synthesize_seed(program, elems)
-        origin = f"synthesized ({elems} elems/buffer)"
+        seed, size, grew = _autosize_seed(program, elems, pids)
+        origin = f"synthesized ({size} elems/buffer)"
+        if grew:
+            origin += f", grown from {elems}"
 
     # interpreter side
     interp_mem = Memory()
@@ -561,7 +679,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Check the interpreter against numpy.")
     parser.add_argument("program", help="a .lineir or .tileir file")
     parser.add_argument("--elems", type=int, default=20000,
-                        help="buffer size when inputs are synthesized")
+                        help="starting buffer size when inputs are synthesized "
+                             "(grown automatically if the kernel indexes past it)")
     parser.add_argument("--pid", default="0,0,0", help="program ids, comma separated")
     parser.add_argument("--rtol", type=float, default=1e-9)
     parser.add_argument("--atol", type=float, default=1e-12)

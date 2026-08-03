@@ -59,6 +59,7 @@ class Statement:
     types: str
     body: list["Statement"] = field(default_factory=list)
     header: str = ""
+    text: str = ""
 
 
 def _strip_comments(text: str) -> str:
@@ -110,7 +111,7 @@ def _split_statements(text: str) -> list[Statement]:
         if char == "{":
             depth = 1
             # the header may span several physical lines already sitting in _PARTIAL
-            pending_header = " ".join(_PARTIAL + ["".join(buffer)]).strip()
+            pending_header = " ".join(_PARTIAL + ["".join(buffer)]).strip().replace("#", "__")
             _PARTIAL.clear()
             buffer = []
             continue
@@ -153,26 +154,33 @@ def _flush(line: str) -> list[Statement]:
 def _parse_statement(line: str) -> Statement | None:
     if not line or line in {"}", "{"}:
         return None
+    line = line.replace("#", "__")  # SSA result selector: %v#1 -> %v__1
 
     results: list[str] = []
     rest = line
     if "=" in line:
         head, _, tail = line.partition("=")
-        if re.fullmatch(r"[\s%\w,]+", head) and "%" in head:
-            results = re.findall(r"%([\w.]+)", head)
+        head_s = head.strip()
+        multi = re.fullmatch(r"%([\w.]+):(\d+)", head_s)
+        if multi:  # a multi-result op, %name:N binds N results
+            results = [f"{multi.group(1)}__{i}" for i in range(int(multi.group(2)))]
+            rest = tail.strip()
+        elif re.fullmatch(r"[\s%\w,.]+", head_s) and "%" in head_s:
+            results = re.findall(r"%([\w.]+)", head_s)
             rest = tail.strip()
 
     rest = rest.strip()
     if not rest:
         return None
 
-    # pull the literal out first; its own colon would break the type split
+    # pull a scalar literal out first; its own colon would break the type split
     literal = None
     literal_match = re.search(r"<\s*[a-z]\w*\s*:\s*([-\d.e+]+)\s*>", rest)
     if literal_match:
         literal = literal_match.group(1)
         rest = (rest[: literal_match.start()] + " " + rest[literal_match.end():]).strip()
 
+    full = rest  # keep the type annotation; some ops carry structure inside it
     head, _, types = rest.partition(":")
     head = head.strip()
 
@@ -183,7 +191,7 @@ def _parse_statement(line: str) -> Statement | None:
     if opcode.startswith("cuda_tile."):
         opcode = opcode[len("cuda_tile.") :]
     operands = re.findall(r"%([\w.]+)", head)
-    return Statement(results, opcode, operands, literal, types.strip())
+    return Statement(results, opcode, operands, literal, types.strip(), text=full)
 
 
 class CuTileTranslator:
@@ -191,8 +199,9 @@ class CuTileTranslator:
 
     def __init__(self, *, max_ops: int = 400) -> None:
         self.max_ops = max_ops
-        self.program: IRProgram | None = None
+        self.program: Program | None = None
         self.pointers: dict[str, Pointer] = {}
+        self.views: dict[str, str] = {}  # view name -> underlying buffer name
         self.params: list[str] = []
         self.notes: list[str] = []
 
@@ -200,16 +209,31 @@ class CuTileTranslator:
         text = _strip_comments(source)
         _PARTIAL.clear()
 
+        if not text.strip():
+            raise CuTileError(
+                "the file is empty; paste a CUDA Tile IR kernel into it "
+                "(see examples/vector_add.tileir for the smallest working one)"
+            )
         entry = re.search(r"entry\s+@([\w.]+)\s*\((.*?)\)\s*\{", text, re.DOTALL)
         if entry is None:
-            raise CuTileError("no 'entry @name(...) {' found")
+            raise CuTileError(
+                "no 'entry @name(...) {' block found; a CUDA Tile IR kernel needs "
+                "'cuda_tile.module @m { entry @name(%a: tile<ptr<f32>>, ...) { ... } }' "
+                "(see examples/vector_add.tileir)"
+            )
 
         name = entry.group(1)
-        self.params = [
-            arg.split(":")[0].strip().lstrip("%")
-            for arg in entry.group(2).split(",")
-            if arg.strip()
-        ]
+        # Split the parameter list and tell pointers from scalars by their type.
+        # A pointer parameter names a buffer; a scalar (a shape or a stride) is an
+        # ordinary runtime value bound from the inputs.
+        is_pointer: dict[str, bool] = {}
+        self.params = []
+        for arg in entry.group(2).split(","):
+            if not arg.strip():
+                continue
+            param = arg.split(":")[0].strip().lstrip("%")
+            self.params.append(param)
+            is_pointer[param] = "ptr<" in arg
 
         body_start = entry.end()
         body_end = _matching_brace(text, body_start - 1)
@@ -220,8 +244,8 @@ class CuTileTranslator:
         self._add("kernel", name=name, params=self.params)
 
         for param in self.params:
-            buffer = _buffer_name(param)
-            self.pointers[param] = Pointer(buffer)
+            if is_pointer[param]:
+                self.pointers[param] = Pointer(_buffer_name(param))
 
         for statement in _split_statements(text[body_start:body_end]):
             self._statement(statement)
@@ -249,7 +273,9 @@ class CuTileTranslator:
         shape = _result_shape(st.types)
         out = st.results[0]
         if shape:
-            self._add("fill", out=out, args=[list(shape)], value=st.literal)
+            # the shape must reach fill as one bracketed list, not flattened ints
+            dims = ",".join(str(dim) for dim in shape)
+            self._add("fill", out=out, args=f"[{dims}]", value=st.literal)
         else:
             self._add("assign", out=out, value=st.literal)
 
@@ -305,6 +331,62 @@ class CuTileTranslator:
         acc = st.operands[2] if len(st.operands) > 2 else None
         self._add("mma", out=st.results[0], lhs=st.operands[0],
                   rhs=st.operands[1], acc=acc)
+
+    def _op_assume(self, st: Statement) -> None:
+        """An alignment hint; pass the value through unchanged."""
+        out, operand = st.results[0], st.operands[0]
+        if operand in self.pointers:
+            self.pointers[out] = self.pointers[operand]
+        elif operand in self.views:
+            self.views[out] = self.views[operand]
+        else:
+            self._add("assign", out=out, value=operand)
+
+    def _op_make_tensor_view(self, st: Statement) -> None:
+        operand = st.operands[0]
+        buffer = self._buffer_of(operand)
+        if buffer is None:
+            raise CuTileError(f"make_tensor_view on {operand!r}, which is not a pointer")
+        out = st.results[0]
+        self._add(
+            "tensor_view", out=out, buf=buffer,
+            shape=_bracket_list(st.text, "shape"),
+            strides=_bracket_list(st.text, "strides"),
+        )
+        self.views[out] = buffer
+
+    def _op_make_partition_view(self, st: Statement) -> None:
+        view = st.operands[0]
+        out = st.results[0]
+        self._add(
+            "partition_view", out=out, view=view,
+            tile=_paren_dims(st.text), dim_map=_bracket_list(st.text, "dim_map"),
+        )
+        self.views[out] = self.views.get(view)
+
+    def _op_get_index_space_shape(self, st: Statement) -> None:
+        # bracket the targets so the interpreter unpacks the result tuple
+        self._add("index_space", out="(" + ",".join(st.results) + ")", view=st.operands[0])
+
+    def _op_load_view_tko(self, st: Statement) -> None:
+        view, index = _subscript(st.text)
+        buffer = self.views.get(view)
+        self._add("load_view", out=st.results[0], view=view, buf=buffer, index=index)
+
+    def _op_store_view_tko(self, st: Statement) -> None:
+        view, index = _subscript(st.text)
+        blocked = {view, *index.split(",")}
+        value = next((o for o in st.operands if o not in blocked), None)
+        if value is None:
+            raise CuTileError(f"store_view_tko found no value operand in {st.text!r}")
+        buffer = self.views.get(view)
+        self._add("store_view", view=view, buf=buffer, value=value, index=index)
+
+    def _buffer_of(self, name: str) -> str | None:
+        if name in self.views:
+            return self.views[name]
+        pointer = self.pointers.get(name)
+        return pointer.buffer if pointer is not None else None
 
     def _op_for(self, st: Statement) -> None:
         """Lower an SSA loop with iter_values into the flat for/endfor form."""
@@ -372,6 +454,36 @@ class CuTileTranslator:
             if value is not None and value != ""
         }
         self.program.ops.append(Op(len(self.program.ops), opcode, clean))
+
+
+def _clean_names(text: str) -> str:
+    """Comma-join the identifiers and integer literals in a bracketed list."""
+    parts = [part.strip().lstrip("%") for part in text.split(",")]
+    return ",".join(part for part in parts if part)
+
+
+def _bracket_list(text: str, key: str) -> str:
+    """The 'key = [a, b]' list from a statement, as 'a,b'."""
+    match = re.search(rf"{key}\s*=\s*\[([^\]]*)\]", text)
+    if match is None:
+        raise CuTileError(f"expected '{key} = [...]' in {text!r}")
+    return _clean_names(match.group(1))
+
+
+def _paren_dims(text: str) -> str:
+    """The 'tile=(128x64)' dimensions from a partition-view type, as '128,64'."""
+    match = re.search(r"tile\s*=\s*\(([\dx]+)\)", text)
+    if match is None:
+        raise CuTileError(f"expected 'tile=(...)' in {text!r}")
+    return ",".join(match.group(1).split("x"))
+
+
+def _subscript(text: str) -> tuple[str, str]:
+    """A '%view[%i, %j]' access, returning (view, 'i,j')."""
+    match = re.search(r"%([\w.]+)\s*\[([^\]]*)\]", text)
+    if match is None:
+        raise CuTileError(f"expected a '%view[...]' access in {text!r}")
+    return match.group(1), _clean_names(match.group(2))
 
 
 def _stringify(value: object) -> str:

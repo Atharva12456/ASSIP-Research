@@ -1,0 +1,123 @@
+// A corrected square GEMM: C[S,S] = A[S,S] @ B[S,S], row-major, tiled 64x64x64.
+//
+// Each tile block computes one 64x64 tile of C by reducing over the K tiles.
+// Every change from the original draft is marked `// FIX`.
+//
+// To run in the pure-Python interpreter this is set to S = 256 (so the K loop
+// runs S/64 = 4 times). For the real 4096x4096, set:
+//     %matrix_width -> 4096, %num_k_tiles -> 64, %b_advance -> 262144  (= 64 * 4096)
+cuda_tile.module @gemm_square_module {
+    entry @gemm_square_kernel(
+        %a_ptr_base_scalar: tile<ptr<f32>>,
+        %b_ptr_base_scalar: tile<ptr<f32>>,
+        %c_ptr_base_scalar: tile<ptr<f32>>
+    ) {
+        %block_x_index, %block_y_index, %block_z_index = get_tile_block_id : tile<i32>
+
+        %tile_size = cuda_tile.constant <i32: 64> : tile<i32>
+        // FIX: a matrix row stride is the matrix width, not the tile size.
+        %matrix_width = cuda_tile.constant <i32: 256> : tile<64x64xi32>
+        // FIX: the dimension that runs along contiguous memory has stride 1.
+        %unit_stride = cuda_tile.constant <i32: 1> : tile<64x64xi32>
+        // FIX: the K loop runs once per K tile (width / 64), not tile_size times.
+        %num_k_tiles = cuda_tile.constant <i32: 4> : tile<i32>
+
+        %range_start = cuda_tile.constant <i32: 0> : tile<i32>
+        // FIX: the loop step is 1. The draft stepped by %range_start (= 0).
+        %range_step = cuda_tile.constant <i32: 1> : tile<i32>
+        %init_accum = cuda_tile.constant <f32: 0.000000e+00> : tile<64x64xf32>
+
+        %tile_size_range = cuda_tile.iota : tile<64xi32>
+
+        // ---- A tile offsets: row (M) uses matrix_width, column (K) uses 1 ----
+        %a_row_base = cuda_tile.muli %block_x_index, %tile_size : tile<i32>
+        %a_row_base_r = cuda_tile.reshape %a_row_base : tile<i32> -> tile<1xi32>
+        %a_row_base_t = cuda_tile.broadcast %a_row_base_r : tile<1xi32> -> tile<64xi32>
+        %m_vec = cuda_tile.addi %a_row_base_t, %tile_size_range : tile<64xi32>
+        %m_col = cuda_tile.reshape %m_vec : tile<64xi32> -> tile<64x1xi32>
+        %m_bc = cuda_tile.broadcast %m_col : tile<64x1xi32> -> tile<64x64xi32>
+        %m_offsets = cuda_tile.muli %m_bc, %matrix_width : tile<64x64xi32>
+
+        %k_row = cuda_tile.reshape %tile_size_range : tile<64xi32> -> tile<1x64xi32>
+        %k_bc = cuda_tile.broadcast %k_row : tile<1x64xi32> -> tile<64x64xi32>
+        %k_offsets = cuda_tile.muli %k_bc, %unit_stride : tile<64x64xi32>
+
+        %a_tile_offsets = cuda_tile.addi %m_offsets, %k_offsets : tile<64x64xi32>
+
+        // ---- B tile offsets: row (K) uses matrix_width, column (N) uses 1 ----
+        %bk_col = cuda_tile.reshape %tile_size_range : tile<64xi32> -> tile<64x1xi32>
+        %bk_bc = cuda_tile.broadcast %bk_col : tile<64x1xi32> -> tile<64x64xi32>
+        %bk_offsets = cuda_tile.muli %bk_bc, %matrix_width : tile<64x64xi32>
+
+        %b_col_base = cuda_tile.muli %block_y_index, %tile_size : tile<i32>
+        %b_col_base_r = cuda_tile.reshape %b_col_base : tile<i32> -> tile<1xi32>
+        %b_col_base_t = cuda_tile.broadcast %b_col_base_r : tile<1xi32> -> tile<64xi32>
+        %n_vec = cuda_tile.addi %b_col_base_t, %tile_size_range : tile<64xi32>
+        %n_row = cuda_tile.reshape %n_vec : tile<64xi32> -> tile<1x64xi32>
+        %n_bc = cuda_tile.broadcast %n_row : tile<1x64xi32> -> tile<64x64xi32>
+        %n_offsets = cuda_tile.muli %n_bc, %unit_stride : tile<64x64xi32>
+
+        // FIX: the two offset planes are added, not multiplied.
+        %b_tile_offsets = cuda_tile.addi %bk_offsets, %n_offsets : tile<64x64xi32>
+
+        // ---- base pointers to tile pointers ----
+        %a_ptr_t = cuda_tile.reshape %a_ptr_base_scalar : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+        %a_ptr = cuda_tile.broadcast %a_ptr_t : tile<1x1xptr<f32>> -> tile<64x64xptr<f32>>
+        %a_tile_ptr = offset %a_ptr, %a_tile_offsets : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+        %b_ptr_t = reshape %b_ptr_base_scalar : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+        %b_ptr = broadcast %b_ptr_t : tile<1x1xptr<f32>> -> tile<64x64xptr<f32>>
+        %b_tile_ptr = offset %b_ptr, %b_tile_offsets : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+        // FIX: A advances 64 contiguous columns per K tile; B advances 64 whole rows.
+        %a_advance = cuda_tile.constant <i32: 64> : tile<64x64xi32>
+        %b_advance = cuda_tile.constant <i32: 16384> : tile<64x64xi32>
+
+        // FIX: loop to num_k_tiles, step range_step.
+        %C_tile, %a_final, %b_final = for %k in (%range_start to %num_k_tiles, step %range_step) : tile<i32>
+            iter_values(
+                %acc_prev = %init_accum,
+                %a_tile_ptr_prev = %a_tile_ptr,
+                %b_tile_ptr_prev = %b_tile_ptr
+            ) -> (tile<64x64xf32>, tile<64x64xptr<f32>>, tile<64x64xptr<f32>>)
+        {
+            // FIX: load through the carried pointers, not the pre-loop ones.
+            %A_tile, %token_a = load_ptr_tko weak %a_tile_ptr_prev : tile<64x64xptr<f32>> -> tile<64x64xf32>, token
+            %B_tile, %token_b = load_ptr_tko weak %b_tile_ptr_prev : tile<64x64xptr<f32>> -> tile<64x64xf32>, token
+
+            %acc_next = mmaf %A_tile, %B_tile, %acc_prev : tile<64x64xf32>, tile<64x64xf32>, tile<64x64xf32>
+
+            %a_tile_ptr_next = offset %a_tile_ptr_prev, %a_advance : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+            %b_tile_ptr_next = offset %b_tile_ptr_prev, %b_advance : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+            continue %acc_next, %a_tile_ptr_next, %b_tile_ptr_next : tile<64x64xf32>, tile<64x64xptr<f32>>, tile<64x64xptr<f32>>
+        }
+
+        // ---- C tile offsets: row (M) uses matrix_width, column (N) uses 1 ----
+        %c_row_base = muli %block_x_index, %tile_size : tile<i32>
+        %c_row_base_r = reshape %c_row_base : tile<i32> -> tile<1xi32>
+        %c_row_base_t = broadcast %c_row_base_r : tile<1xi32> -> tile<64xi32>
+        %c_m_vec = addi %c_row_base_t, %tile_size_range : tile<64xi32>
+        %c_m_col = reshape %c_m_vec : tile<64xi32> -> tile<64x1xi32>
+        %c_m_bc = broadcast %c_m_col : tile<64x1xi32> -> tile<64x64xi32>
+        %c_m_offsets = muli %c_m_bc, %matrix_width : tile<64x64xi32>
+
+        // FIX: the N coordinate uses block_y_index (the draft used block_x_index).
+        %c_col_base = muli %block_y_index, %tile_size : tile<i32>
+        %c_col_base_r = reshape %c_col_base : tile<i32> -> tile<1xi32>
+        %c_col_base_t = broadcast %c_col_base_r : tile<1xi32> -> tile<64xi32>
+        %c_n_vec = addi %c_col_base_t, %tile_size_range : tile<64xi32>
+        %c_n_row = reshape %c_n_vec : tile<64xi32> -> tile<1x64xi32>
+        %c_n_bc = broadcast %c_n_row : tile<1x64xi32> -> tile<64x64xi32>
+        %c_n_offsets = muli %c_n_bc, %unit_stride : tile<64x64xi32>
+
+        // FIX: the two offset planes are added, not multiplied.
+        %c_tile_offsets = addi %c_m_offsets, %c_n_offsets : tile<64x64xi32>
+
+        %c_ptr_t = reshape %c_ptr_base_scalar : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+        %c_ptr = broadcast %c_ptr_t : tile<1x1xptr<f32>> -> tile<64x64xptr<f32>>
+        %c_tile_ptr = offset %c_ptr, %c_tile_offsets : tile<64x64xptr<f32>>, tile<64x64xi32> -> tile<64x64xptr<f32>>
+
+        store_ptr_tko weak %c_tile_ptr, %C_tile : tile<64x64xptr<f32>>, tile<64x64xf32> -> token
+    }
+}
