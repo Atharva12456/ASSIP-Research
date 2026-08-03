@@ -1,0 +1,16 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/layernorm.lineir
+# max_ops=220
+0000 | kernel       | name=layernorm params="A,N,eps,Out"
+0001 | load         | out=a buf=A
+0002 | reduce       | out=rowsum value=a op=sum axis=1 keepdims=true
+0003 | div          | out=mean lhs=rowsum rhs=N
+0004 | sub          | out=centered lhs=a rhs=mean
+0005 | mul          | out=sq lhs=centered rhs=centered
+0006 | reduce       | out=sqsum value=sq op=sum axis=1 keepdims=true
+0007 | div          | out=var lhs=sqsum rhs=N
+0008 | add          | out=vare lhs=var rhs=eps
+0009 | rsqrt        | out=inv value=vare
+0010 | mul          | out=y lhs=centered rhs=inv
+0011 | store        | buf=Out value=y

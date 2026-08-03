@@ -267,6 +267,27 @@ class MathOpcodeTests(unittest.TestCase):
         self.assertEqual(one("select | out=z cond=true true=1 false=2").env["z"], 1)
         self.assertEqual(one("select | out=z cond=false true=1 false=2").env["z"], 2)
 
+    def test_relu_clamps_negatives(self) -> None:
+        result = one("relu | out=z value=v", v=Tile.from_flat([-2.0, -0.1, 0.0, 3.0], (4,), "f32"))
+        self.assertEqual(result.env["z"].to_nested(), [0.0, 0.0, 0.0, 3.0])
+
+    def test_sigmoid_and_tanh_at_zero(self) -> None:
+        zero = Tile.from_flat([0.0], (1,), "f32")
+        self.assertAlmostEqual(one("sigmoid | out=z value=v", v=zero).env["z"].data[0], 0.5)
+        self.assertAlmostEqual(one("tanh | out=z value=v", v=zero).env["z"].data[0], 0.0)
+
+    def test_neg_and_abs_keep_integer_dtype(self) -> None:
+        v = Tile.from_flat([5, -6], (2,), "i32")
+        neg = one("neg | out=z value=v", v=v).env["z"]
+        absed = one("abs | out=z value=v", v=v).env["z"]
+        self.assertEqual((neg.to_nested(), neg.dtype), ([-5, 6], "i32"))
+        self.assertEqual((absed.to_nested(), absed.dtype), ([5, 6], "i32"))
+
+    def test_floor_and_ceil(self) -> None:
+        v = Tile.from_flat([1.2, 2.8, -1.5], (3,), "f32")
+        self.assertEqual(one("floor | out=z value=v", v=v).env["z"].to_nested(), [1.0, 2.0, -2.0])
+        self.assertEqual(one("ceil | out=z value=v", v=v).env["z"].to_nested(), [2.0, 3.0, -1.0])
+
     def test_transpose_reverses_the_axes(self) -> None:
         a = Tile.from_nested([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
         result = one("transpose | out=t value=a", a=a)
@@ -852,6 +873,21 @@ REDUCTION_BATTERY = """0000 | assign    | out=M value="[[1.0,2.0],[3.0,4.0]]"
 0006 | broadcast | out=Wide value=Top shape=2x2
 0007 | mma       | out=Prod lhs=M rhs=M acc=M"""
 
+UNARY_BATTERY = """0000 | fill    | out=x args="[3]" value=2.0
+0001 | log     | out=o1 value=x
+0002 | sin     | out=o2 value=x
+0003 | cos     | out=o3 value=x
+0004 | tanh    | out=o4 value=x
+0005 | sigmoid | out=o5 value=x
+0006 | rsqrt   | out=o6 value=x
+0007 | recip   | out=o7 value=x
+0008 | abs     | out=o8 value=x
+0009 | neg     | out=o9 value=x
+0010 | floor   | out=o10 value=x
+0011 | ceil    | out=o11 value=x
+0012 | sign    | out=o12 value=x
+0013 | relu    | out=o13 value=x"""
+
 VIEW_BATTERY = """0000 | tensor_view    | out=V buf=Buf shape="2,3" strides="3,1"
 0001 | partition_view | out=P view=V tile="2,3" dim_map="0,1"
 0002 | index_space    | out="(nr,nc)" view=P
@@ -888,6 +924,7 @@ class OpcodeCoverageTests(unittest.TestCase):
             (MATH_BATTERY, {}),
             (DOT_BATTERY, {}),
             (REDUCTION_BATTERY, {}),
+            (UNARY_BATTERY, {}),
             (VIEW_BATTERY, {"Buf": Tile.from_flat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), "f32")}),
             (CONTROL_BATTERY, {}),
         ]

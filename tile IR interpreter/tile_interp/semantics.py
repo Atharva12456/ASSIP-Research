@@ -453,14 +453,37 @@ def _exec_select(ctx: "ExecContext", op: Op) -> object:
     return bind_output(ctx, op, _where_select(cond, on_true, on_false))
 
 
-def _exec_unary_math(ctx: "ExecContext", op: Op) -> object:
-    fn = math.exp if op.opcode == "exp" else math.sqrt
+# Elementwise unary ops. The first group always returns a float; the second
+# keeps the operand's dtype so abs and neg of an integer stay integer.
+_FLOAT_UNARY: dict[str, Callable[[float], float]] = {
+    "exp": math.exp,
+    "log": math.log,
+    "sqrt": math.sqrt,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tanh": math.tanh,
+    "sigmoid": lambda x: 1.0 / (1.0 + math.exp(-x)),
+    "rsqrt": lambda x: 1.0 / math.sqrt(x),
+    "recip": lambda x: 1.0 / x,
+}
+_KEEP_UNARY: dict[str, Callable[[float], float]] = {
+    "abs": abs,
+    "neg": lambda x: -x,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "sign": lambda x: (x > 0) - (x < 0),
+    "relu": lambda x: x if x > 0 else 0,
+}
+
+
+def _exec_unary(ctx: "ExecContext", op: Op) -> object:
+    keep = op.opcode in _KEEP_UNARY
+    fn = _KEEP_UNARY[op.opcode] if keep else _FLOAT_UNARY[op.opcode]
     value = ctx.value(op.require("value"))
     if isinstance(value, Tile):
-        result: object = value.map(lambda item: _guard_math(fn, item), float_dtype(value.dtype))
-    else:
-        result = _guard_math(fn, value)
-    return bind_output(ctx, op, result)
+        dtype = value.dtype if keep else float_dtype(value.dtype)
+        return bind_output(ctx, op, value.map(lambda item: _guard_math(fn, item), dtype))
+    return bind_output(ctx, op, _guard_math(fn, value))
 
 
 def _exec_minmax(ctx: "ExecContext", op: Op) -> object:
@@ -843,8 +866,8 @@ OPCODES: dict[str, OpSpec] = dict(
         _spec("index_space", "memory", 1, _effects_value("view"), _exec_index_space),
         _spec("load_view", "memory", 4, _effects_load_view, _exec_load_view),
         _spec("store_view", "memory", 4, _effects_store_view, _exec_store_view),
-        _spec("exp", "math", 3, _effects_value("value"), _exec_unary_math),
-        _spec("sqrt", "math", 3, _effects_value("value"), _exec_unary_math),
+        *(_spec(name, "math", 3, _effects_value("value"), _exec_unary) for name in _FLOAT_UNARY),
+        *(_spec(name, "math", 1, _effects_value("value"), _exec_unary) for name in _KEEP_UNARY),
         _spec("max", "math", 1, _effects_value("lhs", "rhs"), _exec_minmax),
         _spec("min", "math", 1, _effects_value("lhs", "rhs"), _exec_minmax),
         _spec("select", "math", 1, _effects_value("cond", "true", "false"), _exec_select),

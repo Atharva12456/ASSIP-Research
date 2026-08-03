@@ -418,6 +418,90 @@ def _inputs_reduction() -> Inputs:
     }
 
 
+def softmax(inputs: Inputs) -> Outputs:
+    """Row-wise softmax: subtract the row max, exponentiate, and normalize."""
+    a = inputs["A"].to_nested()
+    out: list[list[float]] = []
+    for row in a:
+        top = row[0]
+        for value in row:
+            if value > top:
+                top = value
+        exps = [math.exp(value - top) for value in row]
+        total = 0.0
+        for value in exps:
+            total = total + value
+        out.append([value / total for value in exps])
+    return {"Out": Tile.from_nested(out, "f32")}
+
+
+def layernorm(inputs: Inputs) -> Outputs:
+    """Row-wise layer normalization: (x - mean) / sqrt(variance + eps)."""
+    a = inputs["A"].to_nested()
+    count = inputs["N"].item()
+    eps = inputs["eps"].item()
+    out: list[list[float]] = []
+    for row in a:
+        total = 0.0
+        for value in row:
+            total = total + value
+        mean = total / count
+        centered = [value - mean for value in row]
+        sq = 0.0
+        for value in centered:
+            sq = sq + value * value
+        inv = 1.0 / math.sqrt(sq / count + eps)
+        out.append([value * inv for value in centered])
+    return {"Out": Tile.from_nested(out, "f32")}
+
+
+def activations(inputs: Inputs) -> Outputs:
+    """relu, tanh, and sigmoid applied to one input tile."""
+    x = inputs["X"].to_nested()
+    relu = [value if value > 0 else 0.0 for value in x]
+    tanh = [math.tanh(value) for value in x]
+    sigmoid = [1.0 / (1.0 + math.exp(-value)) for value in x]
+    return {"R": Tile.from_nested(relu, "f32"), "T": Tile.from_nested(tanh, "f32"), "S": Tile.from_nested(sigmoid, "f32")}
+
+
+def power_loop(inputs: Inputs) -> Outputs:
+    """x^4, computed by a for-loop that multiplies a tile into itself three times."""
+    x = inputs["X"].to_nested()
+    return {"Out": Tile.from_nested([value ** 4 for value in x], "f32")}
+
+
+def _inputs_softmax() -> Inputs:
+    return {
+        "A": Tile.from_flat([1.0, 2.0, 3.0, 2.0, 0.0, -1.0], (2, 3), "f32"),
+        "Out": Tile.zeros((2, 3), "f32"),
+    }
+
+
+def _inputs_layernorm() -> Inputs:
+    return {
+        "A": Tile.from_flat([1.0, 2.0, 3.0, 4.0, 2.0, 2.0, 2.0, 2.0], (2, 4), "f32"),
+        "N": Tile.scalar(4, "i32"),
+        "eps": Tile.scalar(1e-5, "f32"),
+        "Out": Tile.zeros((2, 4), "f32"),
+    }
+
+
+def _inputs_activations() -> Inputs:
+    return {
+        "X": Tile.from_flat([-2.0, -0.5, 0.0, 1.0, 3.0], (5,), "f32"),
+        "R": Tile.zeros((5,), "f32"),
+        "T": Tile.zeros((5,), "f32"),
+        "S": Tile.zeros((5,), "f32"),
+    }
+
+
+def _inputs_power_loop() -> Inputs:
+    return {
+        "X": Tile.from_flat([1.0, 2.0, 3.0, 0.5], (4,), "f32"),
+        "Out": Tile.zeros((4,), "f32"),
+    }
+
+
 @dataclass(slots=True)
 class Example:
     """One example program: its reference kernel, its seed buffers, and its outputs."""
@@ -521,6 +605,34 @@ EXAMPLES: dict[str, Example] = {
             _inputs_reduction,
             ["RowSum", "Total", "Norm"],
             "reduce along an axis, reduce to a scalar, and a keepdims broadcast",
+        ),
+        Example(
+            "softmax",
+            softmax,
+            _inputs_softmax,
+            ["Out"],
+            "row-wise softmax over a 2-D tile",
+        ),
+        Example(
+            "layernorm",
+            layernorm,
+            _inputs_layernorm,
+            ["Out"],
+            "row-wise layer normalization with mean, variance, and rsqrt",
+        ),
+        Example(
+            "activations",
+            activations,
+            _inputs_activations,
+            ["R", "T", "S"],
+            "relu, tanh, and sigmoid over one input tile",
+        ),
+        Example(
+            "power_loop",
+            power_loop,
+            _inputs_power_loop,
+            ["Out"],
+            "x^4 through a for-loop that accumulates into a tile",
         ),
     )
 }

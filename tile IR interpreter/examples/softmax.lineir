@@ -1,0 +1,12 @@
+# unified-tile-ir line-format v0
+# source_lang=tileir
+# source=examples/softmax.lineir
+# max_ops=220
+0000 | kernel       | name=softmax params="A,Out"
+0001 | load         | out=a buf=A
+0002 | reduce       | out=rowmax value=a op=max axis=1 keepdims=true
+0003 | sub          | out=shifted lhs=a rhs=rowmax
+0004 | exp          | out=e value=shifted
+0005 | reduce       | out=rowsum value=e op=sum axis=1 keepdims=true
+0006 | div          | out=probs lhs=e rhs=rowsum
+0007 | store        | buf=Out value=probs

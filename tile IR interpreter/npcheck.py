@@ -257,6 +257,14 @@ _REDUCERS = {
     "sum": np.sum, "prod": np.prod, "max": np.max, "min": np.min,
 }
 
+_NP_UNARY = {
+    "exp": np.exp, "log": np.log, "sqrt": np.sqrt, "sin": np.sin, "cos": np.cos,
+    "tanh": np.tanh, "sigmoid": lambda a: 1.0 / (1.0 + np.exp(-a)),
+    "rsqrt": lambda a: 1.0 / np.sqrt(a), "recip": lambda a: 1.0 / a,
+    "abs": np.abs, "neg": lambda a: -a, "floor": np.floor, "ceil": np.ceil,
+    "sign": np.sign, "relu": lambda a: np.maximum(a, 0.0),
+}
+
 
 class NumpyExecutor:
     """Runs a Program with numpy, mirroring the interpreter's control flow."""
@@ -319,6 +327,10 @@ class NumpyExecutor:
         return self.memory
 
     def _exec(self, op: Op) -> None:
+        unary = _NP_UNARY.get(op.opcode)
+        if unary is not None:
+            self._bind(op, unary(np.asarray(self._val(op, "value"), np.float64)))
+            return
         handler = getattr(self, f"_op_{op.opcode}", None)
         if handler is None:
             raise ValueError(f"numpy executor has no rule for opcode {op.opcode!r}")
@@ -429,8 +441,8 @@ class NumpyExecutor:
             out = fn(out, nxt)
         return out
 
-    def _op_exp(self, op): return np.exp(np.asarray(self._val(op, "value"), np.float64))
-    def _op_sqrt(self, op): return np.sqrt(np.asarray(self._val(op, "value"), np.float64))
+    # exp, sqrt, and the other elementwise unary ops share one numpy dispatch;
+    # see _NP_UNARY and _exec.
 
     def _op_dot(self, op): return np.matmul(self._val(op, "lhs"), self._val(op, "rhs"))
 
